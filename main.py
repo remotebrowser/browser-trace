@@ -107,6 +107,7 @@ def apply_config(new: Config) -> None:
             token=new.logfire_token,
             send_to_logfire=bool(new.logfire_token),
             service_name=new.service_name,
+            inspect_arguments=False,
         )
         if new.logfire_token:
             log(f"Logfire configured: service={new.service_name}")
