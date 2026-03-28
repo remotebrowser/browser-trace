@@ -10,7 +10,14 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -22,11 +29,29 @@ jobs:
       - name: Build with PyInstaller
         run: uv run pyinstaller browser-trace.spec
 
-      - name: Create release and upload asset
+      - name: Rename binary with arch suffix
+        run: mv dist/browser-trace dist/browser-trace-linux-${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: browser-trace-linux-${{ matrix.arch }}
+          path: dist/browser-trace-linux-${{ matrix.arch }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release and upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ github.ref_name }}" \
-            dist/browser-trace \
+            artifacts/browser-trace-linux-* \
+            --repo "${{ github.repository }}" \
             --title "${{ github.ref_name }}" \
             --generate-notes
