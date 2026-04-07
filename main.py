@@ -17,6 +17,7 @@ import websockets
 @dataclass
 class Config:
     service_name: str = "browser-trace"
+    environment: str = "local"
     logfire_token: str = ""
     cdp_host: str = "127.0.0.1"
     cdp_port: int = 9222
@@ -38,6 +39,7 @@ class Config:
         tp = values.get("LOGFIRE_TRACEPARENT", "")
         return cls(
             service_name=values.get("SERVICE_NAME", "browser-trace"),
+            environment=values.get("ENVIRONMENT", "local"),
             logfire_token=values.get("LOGFIRE_TOKEN", ""),
             cdp_host=values.get("CDP_HOST", "127.0.0.1"),
             cdp_port=int(values.get("CDP_PORT", "9222")),
@@ -105,12 +107,15 @@ def apply_config(new: Config) -> None:
     if new.logfire_token != old.logfire_token or new.service_name != old.service_name:
         logfire.configure(
             token=new.logfire_token,
+            environment=new.environment,
             send_to_logfire=bool(new.logfire_token),
             service_name=new.service_name,
             inspect_arguments=False,
         )
         if new.logfire_token:
-            log(f"Logfire configured: service={new.service_name}")
+            log(
+                f"Logfire configured: service={new.service_name} environment={new.environment}"
+            )
         else:
             log("Logfire token not configured")
 
