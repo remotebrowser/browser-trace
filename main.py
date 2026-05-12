@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Browser trace — monitors tab opens and navigations via CDP."""
+"""Browser trace — monitors tab opens and navigations via CDP, and
+forwards tinyproxy log lines from stdin to Logfire when invoked in
+`tinyproxy` mode."""
 
 import argparse
 import asyncio
 import json
 import os
+import re
 import signal
+import sys
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.request import urlopen
@@ -22,6 +28,11 @@ class Config:
     cdp_host: str = "127.0.0.1"
     cdp_port: int = 9222
     traceparent: str | None = None
+    # Tinyproxy-mode tee threshold. Mirrors `logfire`'s `min_log_level`
+    # console semantics: lines whose mapped Logfire severity is below this
+    # are still sent to Logfire (so the UI sees them) but are not tee'd to
+    # stdout / Fly logs. Hot-reloadable via the config-file watcher.
+    log_level: str = "INFO"
 
     @classmethod
     def from_file(cls, path: str) -> "Config":
@@ -44,6 +55,7 @@ class Config:
             cdp_host=values.get("CDP_HOST", "127.0.0.1"),
             cdp_port=int(values.get("CDP_PORT", "9222")),
             traceparent=tp if tp else None,
+            log_level=values.get("LOG_LEVEL", "INFO").upper(),
         )
 
 
@@ -53,49 +65,69 @@ sessions: dict[str, dict] = {}
 # Maps CDP message ID -> (method, sessionId) for response correlation
 pending_commands: dict[int, tuple[str, str | None]] = {}
 
+# Maps Network.requestId -> {url, frame_id, session_id} for Document-type requests.
+# Populated on Network.requestWillBeSent, consumed on Network.responseReceived
+# (success) or Network.loadingFailed (failure). Bounded because every entry is
+# either matched within a few seconds or the session goes away.
+network_requests: dict[str, dict] = {}
+
 # Auto-incrementing CDP message ID
 _msg_id = 0
 
 # Active config, updated by the file watcher
 _config = Config()
 
+# Prefix prepended to every stdout line this process writes (tee output) and
+# to every Logfire message body. Set once in `main()` from `args.cmd` so the
+# subcommand-mode is visible at-a-glance and never gets mixed up — `[cdp-log]`
+# in CDP mode, `[tinyproxy-log]` in tinyproxy mode. The `-log` suffix makes
+# clear these come from the browser-trace shipper, not from chrome's CDP or
+# the underlying tinyproxy service.
+_log_prefix: str = "[browser-trace]"
 
-def log(msg: str) -> None:
-    print(f"[browser-trace] {msg}", flush=True)
 
 
-def logfire_log(
-    event: str,
-    *,
-    tab_id: str | None = None,
-    tab_url: str | None = None,
-    status_code: int | None = None,
-    event_timestamp: str | None = None,
-) -> None:
-    """Emit a logfire.info call under the current traceparent context, if any."""
-    attrs = {
-        "tab_id": tab_id,
-        "tab_url": tab_url,
-        "status_code": status_code,
-        "event_timestamp": event_timestamp,
-    }
-    attrs = {k: v for k, v in attrs.items() if v is not None}
-    log_func = (
-        logfire.error
-        if status_code is not None and status_code >= 400
-        else logfire.info
-    )
-    msg = event
-    if tab_url:
-        msg += f": {tab_url}"
-    if status_code:
-        msg += f": {status_code}"
-
+def _emit_with_traceparent(log_func, msg: str, attrs: dict) -> None:
     if _config.traceparent:
         with logfire.attach_context({"traceparent": _config.traceparent}):
             log_func(msg, **attrs)
     else:
         log_func(msg, **attrs)
+
+
+def emit_cdp_event(
+    event: str,
+    *,
+    tab_id: str | None = None,
+    tab_url: str | None = None,
+    status_code: int | None = None,
+    error_text: str | None = None,
+    is_main_frame: bool | None = None,
+    event_timestamp: str | None = None,
+) -> None:
+    attrs = {
+        "tab_id": tab_id,
+        "tab_url": tab_url,
+        "status_code": status_code,
+        "error_text": error_text,
+        "is_main_frame": is_main_frame,
+        "event_timestamp": event_timestamp,
+    }
+    attrs = {k: v for k, v in attrs.items() if v is not None}
+    log_func = (
+        logfire.error
+        if error_text is not None
+        or (status_code is not None and status_code >= 400)
+        else logfire.info
+    )
+    msg = f"{_log_prefix} {event}"
+    if tab_url:
+        msg += f": {tab_url}"
+    if status_code:
+        msg += f": {status_code}"
+    if error_text:
+        msg += f": {error_text}"
+    _emit_with_traceparent(log_func, msg, attrs)
 
 
 def apply_config(new: Config) -> None:
@@ -104,26 +136,43 @@ def apply_config(new: Config) -> None:
     old = _config
     _config = new
 
-    if new.logfire_token != old.logfire_token or new.service_name != old.service_name:
+    if (
+        new.logfire_token != old.logfire_token
+        or new.service_name != old.service_name
+        or new.log_level != old.log_level
+    ):
         logfire.configure(
             token=new.logfire_token,
             environment=new.environment,
             send_to_logfire=bool(new.logfire_token),
             service_name=new.service_name,
             inspect_arguments=False,
+            # We tee directly to stdout via `{_log_prefix} …` prints — prefix is
+            # `[cdp-log]` or `[tinyproxy-log]` depending on the subcommand.
+            # Disabling Logfire's console output prevents every emitted record
+            # from being printed a second time, halving Fly-log volume.
+            console=False,
+            # Unify the tee threshold (Fly logs) and the Logfire emission
+            # threshold under a single LOG_LEVEL knob. At `LOG_LEVEL=INFO`
+            # (default) the tinyproxy `CONNECT` / `INFO` lines — mapped to
+            # `logfire.debug` — are dropped before being sent to Logfire, so
+            # the UI isn't billed for per-subresource noise. Set
+            # `LOG_LEVEL=DEBUG` in the config file to surface them.
+            min_level=_logfire_min_level(new.log_level),
         )
         if new.logfire_token:
-            log(
-                f"Logfire configured: service={new.service_name} environment={new.environment}"
+            print(
+                f"{_log_prefix} Logfire configured: service={new.service_name} environment={new.environment}",
+                flush=True,
             )
         else:
-            log("Logfire token not configured")
+            print(f"{_log_prefix} Logfire token not configured", flush=True)
 
     if new.traceparent != old.traceparent:
         if new.traceparent:
-            log(f"Updated traceparent: {new.traceparent[:20]}...")
+            print(f"{_log_prefix} Updated traceparent: {new.traceparent[:20]}...", flush=True)
         else:
-            log("Traceparent cleared")
+            print(f"{_log_prefix} Traceparent cleared", flush=True)
 
 
 def get_browser_ws_url(host: str = "127.0.0.1", port: int = 9222) -> str:
@@ -148,16 +197,34 @@ async def send_cdp(
 
 
 def emit_navigation(session: dict, url: str, status_code: int) -> None:
-    """Emit a navigation log entry."""
-    logfire_log(
+    emit_cdp_event(
         "navigation",
         tab_id=session.get("target_id", ""),
         tab_url=url,
         status_code=status_code,
         event_timestamp=datetime.now(timezone.utc).isoformat(),
     )
-    log(
-        f"navigation: tab={session.get('target_id', '')[:8]} status={status_code} url={url}"
+    print(
+        f"{_log_prefix} navigation: tab={session.get('target_id', '')[:8]} status={status_code} url={url}",
+        flush=True,
+    )
+
+
+def emit_navigation_failed(
+    session: dict, url: str, error_text: str, is_main_frame: bool
+) -> None:
+    emit_cdp_event(
+        "navigation_failed",
+        tab_id=session.get("target_id", ""),
+        tab_url=url,
+        error_text=error_text,
+        is_main_frame=is_main_frame,
+        event_timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+    frame_tag = "main" if is_main_frame else "iframe"
+    print(
+        f"{_log_prefix} navigation_failed: tab={session.get('target_id', '')[:8]} frame={frame_tag} error={error_text} url={url}",
+        flush=True,
     )
 
 
@@ -199,14 +266,15 @@ async def handle_event(ws, event: dict) -> None:
     if method == "Target.targetCreated":
         target_info = params.get("targetInfo", {})
         if target_info.get("type") == "page":
-            logfire_log(
+            emit_cdp_event(
                 "tab_opened",
                 tab_id=target_info.get("targetId", ""),
                 tab_url=target_info.get("url", ""),
                 event_timestamp=datetime.now(timezone.utc).isoformat(),
             )
-            log(
-                f"tab_opened: id={target_info.get('targetId', '')[:8]} url={target_info.get('url', '')}"
+            print(
+                f"{_log_prefix} tab_opened: id={target_info.get('targetId', '')[:8]} url={target_info.get('url', '')}",
+                flush=True,
             )
 
     elif method == "Target.attachedToTarget":
@@ -225,6 +293,11 @@ async def handle_event(ws, event: dict) -> None:
     elif method == "Target.detachedFromTarget":
         sid = params.get("sessionId", "")
         sessions.pop(sid, None)
+        # Drop any in-flight Document requests scoped to this dying session
+        # so network_requests can't grow unbounded across tab churn.
+        stale = [rid for rid, info in network_requests.items() if info.get("session_id") == sid]
+        for rid in stale:
+            network_requests.pop(rid, None)
 
     elif method == "Page.frameNavigated" and session_id:
         frame = params.get("frame", {})
@@ -232,10 +305,26 @@ async def handle_event(ws, event: dict) -> None:
             sessions[session_id]["main_frame_id"] = frame.get("id")
             flush_pending(sessions[session_id])
 
+    elif method == "Network.requestWillBeSent" and session_id:
+        request_id = params.get("requestId", "")
+        resource_type = params.get("type", "")
+        # Track only top-level Document requests; everything else is
+        # sub-resource noise we don't surface as a navigation event.
+        if request_id and resource_type == "Document":
+            request = params.get("request", {})
+            network_requests[request_id] = {
+                "url": request.get("url", ""),
+                "frame_id": params.get("frameId", ""),
+                "session_id": session_id,
+            }
+
     elif method == "Network.responseReceived" and session_id:
         resp = params.get("response", {})
         frame_id = params.get("frameId", "")
         resource_type = params.get("type", "")
+        request_id = params.get("requestId", "")
+        # Successful response — drop the in-flight entry.
+        network_requests.pop(request_id, None)
 
         if session_id in sessions and resource_type == "Document":
             session = sessions[session_id]
@@ -256,6 +345,31 @@ async def handle_event(ws, event: dict) -> None:
                     }
                 )
 
+    elif method == "Network.loadingFailed":
+        # Tunnel failures (proxy returns non-200 to CONNECT), DNS errors,
+        # cert errors, etc. all surface here — Network.responseReceived does
+        # NOT fire for these, so this is the only CDP path that catches them.
+        # We emit for every failed Document load (main frame OR iframe),
+        # tagging which it was via `is_main_frame` so the dashboard can split
+        # them; sub-resources are already excluded upstream because we only
+        # populate `network_requests` for `type=Document`.
+        request_id = params.get("requestId", "")
+        req_info = network_requests.pop(request_id, None)
+        if req_info is None:
+            return  # Sub-resource or already cleaned up
+        if params.get("canceled", False):
+            return  # User-initiated abort, not a real failure
+        sess = sessions.get(req_info["session_id"])
+        if sess is None:
+            return
+        is_main_frame = req_info["frame_id"] == sess.get("main_frame_id")
+        emit_navigation_failed(
+            sess,
+            req_info["url"],
+            params.get("errorText", ""),
+            is_main_frame,
+        )
+
 
 async def watch_config(config_path: str, interval: float = 1.0) -> None:
     """Watch the config file for changes and reload when it appears or changes."""
@@ -266,12 +380,12 @@ async def watch_config(config_path: str, interval: float = 1.0) -> None:
             if mtime != last_mtime:
                 last_mtime = mtime
                 apply_config(Config.from_file(config_path))
-                log(f"Config file updated: {config_path}")
+                print(f"{_log_prefix} Config file updated: {config_path}", flush=True)
         except FileNotFoundError:
             if last_mtime is not None:
                 last_mtime = None
                 apply_config(Config())
-                log("Config file removed, reverted to defaults")
+                print(f"{_log_prefix} Config file removed, reverted to defaults", flush=True)
         await asyncio.sleep(interval)
 
 
@@ -282,14 +396,14 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
         try:
             ws_url = get_browser_ws_url(host=host, port=port)
         except (OSError, Exception):
-            log(f"CDP not reachable at {host}:{port} — retrying in {poll_interval}s")
+            print(f"{_log_prefix} CDP not reachable at {host}:{port} — retrying in {poll_interval}s", flush=True)
             await asyncio.sleep(poll_interval)
             continue
 
-        log(f"Connecting to {ws_url}")
+        print(f"{_log_prefix} Connecting to {ws_url}", flush=True)
         try:
             async with websockets.connect(ws_url, max_size=50 * 1024 * 1024) as ws:
-                log("Connected to CDP")
+                print(f"{_log_prefix} Connected to CDP", flush=True)
 
                 await send_cdp(ws, "Target.setDiscoverTargets", {"discover": True})
                 await send_cdp(
@@ -314,9 +428,10 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
 
                     await handle_event(ws, event)
         except (OSError, websockets.exceptions.WebSocketException) as exc:
-            log(f"CDP connection lost ({exc}) — retrying in {poll_interval}s")
+            print(f"{_log_prefix} CDP connection lost ({exc}) — retrying in {poll_interval}s", flush=True)
             sessions.clear()
             pending_commands.clear()
+            network_requests.clear()
             await asyncio.sleep(poll_interval)
 
 
@@ -340,26 +455,226 @@ async def run(config_path: str) -> None:
                 await task
             except asyncio.CancelledError:
                 pass
-        log("Shutting down")
+        print(f"{_log_prefix} Shutting down", flush=True)
+
+
+# Tinyproxy emits lines like:
+#   CONNECT   May 12 20:25:37 [123]: Connection from 127.0.0.1
+#   ERROR     May 12 20:25:38 [123]: HTTP 407 from upstream
+# The first whitespace-delimited token is the level. Anything we don't
+# recognize falls back to `info`.
+TINYPROXY_LEVEL_TO_LOGFIRE_METHOD: dict[str, str] = {
+    "CRITICAL": "error",
+    "ERROR": "error",
+    "WARNING": "warn",
+    "NOTICE": "notice",
+    # CONNECT + INFO are per-request volume noise (every HTTPS subresource emits
+    # 2–3 lines). They still go to Logfire at debug severity so the UI keeps
+    # them, but at `LOG_LEVEL=INFO` (default) they don't tee to stdout / Fly
+    # logs — see `_should_tee`.
+    "CONNECT": "debug",
+    "INFO": "debug",
+}
+
+# Logfire severity ranks (matching the OTel severityNumber buckets) so the tee
+# threshold can compare across method names and the user-facing LOG_LEVEL.
+_LOGFIRE_METHOD_RANK: dict[str, int] = {
+    "debug": 5,
+    "info": 9,
+    "notice": 10,
+    "warn": 13,
+    "error": 17,
+    "fatal": 21,
+}
+_LOG_LEVEL_RANK: dict[str, int] = {
+    "DEBUG": 5,
+    "INFO": 9,
+    "NOTICE": 10,
+    "WARN": 13,
+    "WARNING": 13,
+    "ERROR": 17,
+    "FATAL": 21,
+    "CRITICAL": 21,
+}
+
+
+def _should_tee(method_name: str, log_level: str) -> bool:
+    line_rank = _LOGFIRE_METHOD_RANK.get(method_name, 9)
+    threshold = _LOG_LEVEL_RANK.get(log_level.upper(), 9)
+    return line_rank >= threshold
+
+
+# Map our LOG_LEVEL value to the lowercase `LevelName` strings that
+# `logfire.configure(min_level=...)` accepts. Unknown values default to `info`.
+_LOG_LEVEL_TO_LOGFIRE_NAME: dict[str, str] = {
+    "DEBUG": "debug",
+    "INFO": "info",
+    "NOTICE": "notice",
+    "WARN": "warn",
+    "WARNING": "warn",
+    "ERROR": "error",
+    "FATAL": "fatal",
+    "CRITICAL": "fatal",
+}
+
+
+def _logfire_min_level(log_level: str) -> str:
+    return _LOG_LEVEL_TO_LOGFIRE_NAME.get(log_level.upper(), "info")
+
+
+def parse_tinyproxy_level(line: str) -> str:
+    parts = line.split(None, 1)
+    if not parts:
+        return ""
+    return parts[0].upper()
+
+
+# Tinyproxy emits lines like:
+#   ERROR     May 12 22:46:31.766 [609]: read_request_line: Client closed socket
+# Strip the date + pid prefix — Logfire stores its own start_timestamp and Fly
+# logs prepend a timestamp too. Result: `ERROR read_request_line: Client closed
+# socket`. The level stays in the body for grep convenience; the structured
+# value is also in the `tinyproxy_level` attribute.
+_TINYPROXY_PREFIX_RE = re.compile(
+    r"^(\S+)\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+\[\d+\]:\s*(.*)$"
+)
+
+
+def strip_tinyproxy_timestamp(line: str) -> str:
+    m = _TINYPROXY_PREFIX_RE.match(line)
+    if not m:
+        return line
+    return f"{m.group(1)} {m.group(2)}"
+
+
+# Tinyproxy emits some lines at ERROR severity that are operationally noise
+# (Chrome opens speculative TCP connections it never writes a request on, etc.).
+# These get demoted to `logfire.debug` so they don't show at LOG_LEVEL=INFO but
+# remain available at DEBUG for triage.
+_TINYPROXY_NOISE_PATTERNS: tuple[str, ...] = (
+    "read_request_line: Client",
+)
+
+
+def _is_tinyproxy_noise(body: str) -> bool:
+    return any(pat in body for pat in _TINYPROXY_NOISE_PATTERNS)
+
+
+def classify_tinyproxy_line(line: str) -> tuple[str, str, str]:
+    body = strip_tinyproxy_timestamp(line)
+    level = parse_tinyproxy_level(body)
+    method_name = TINYPROXY_LEVEL_TO_LOGFIRE_METHOD.get(level, "info")
+    if _is_tinyproxy_noise(body):
+        method_name = "debug"
+    return body, level, method_name
+
+
+def emit_tinyproxy_event(body: str, level: str, method_name: str) -> None:
+    log_func = getattr(logfire, method_name, logfire.info)
+    attrs = {
+        "tinyproxy_level": level or "UNKNOWN",
+        "event_timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    _emit_with_traceparent(log_func, f"{_log_prefix} {body}", attrs)
+
+
+def watch_config_thread(config_path: str, interval: float = 1.0) -> None:
+    last_mtime: float | None = None
+    while True:
+        try:
+            mtime = os.path.getmtime(config_path)
+            if mtime != last_mtime:
+                last_mtime = mtime
+                apply_config(Config.from_file(config_path))
+                print(f"{_log_prefix} Config file updated: {config_path}", flush=True)
+        except FileNotFoundError:
+            if last_mtime is not None:
+                last_mtime = None
+                apply_config(Config())
+                print(f"{_log_prefix} Config file removed, reverted to defaults", flush=True)
+        time.sleep(interval)
+
+
+def run_tinyproxy(config_path: str) -> None:
+    print(f"{_log_prefix} Starting tinyproxy log shipper, reading from stdin", flush=True)
+    watcher = threading.Thread(
+        target=watch_config_thread, args=(config_path,), daemon=True
+    )
+    watcher.start()
+
+    for raw in sys.stdin:
+        line = raw.rstrip("\r\n")
+        if not line:
+            continue
+        body, level, method_name = classify_tinyproxy_line(line)
+        # Tee to stdout (Fly logs) only when the line's severity meets the
+        # configured LOG_LEVEL threshold. Logfire emission below honours the
+        # same threshold via `logfire.configure(min_level=...)`.
+        if _should_tee(method_name, _config.log_level):
+            print(f"{_log_prefix} {body}", flush=True)
+        try:
+            emit_tinyproxy_event(body, level, method_name)
+        except Exception as e:
+            print(f"{_log_prefix} failed to emit tinyproxy event: {e}", flush=True)
+    print(f"{_log_prefix} stdin closed, shutting down", flush=True)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Browser trace")
-    parser.add_argument("config", help="Path to the config file")
+    # Legacy invocation `browser-trace <config>` is sugar for the `cdp`
+    # subcommand. If the first arg is not a known subcommand (and isn't a
+    # flag), insert `cdp` so the existing chrome-live deployment keeps
+    # working unchanged.
+    known_cmds = {"cdp", "tinyproxy"}
+    if (
+        len(sys.argv) >= 2
+        and sys.argv[1] not in known_cmds
+        and not sys.argv[1].startswith("-")
+    ):
+        sys.argv.insert(1, "cdp")
+
+    parser = argparse.ArgumentParser(
+        description="Browser trace + tinyproxy log shipper"
+    )
+    subparsers = parser.add_subparsers(dest="cmd", required=True)
+
+    p_cdp = subparsers.add_parser(
+        "cdp",
+        help="Watch browser tabs via CDP and emit navigation events to Logfire",
+    )
+    p_cdp.add_argument("config", help="Path to the config file")
+
+    p_tp = subparsers.add_parser(
+        "tinyproxy",
+        help="Read tinyproxy log lines from stdin and forward them to Logfire",
+    )
+    p_tp.add_argument("config", help="Path to the config file")
+
     args = parser.parse_args()
+
+    # Pin the stdout / Logfire-message prefix to the actual subcommand so the
+    # CDP and tinyproxy modes never get mixed up.
+    global _log_prefix
+    _log_prefix = f"[{args.cmd}-log]"
 
     config = Config.from_file(args.config)
     if not os.path.exists(args.config):
-        log(
-            f"Config file not found: {args.config} — starting with defaults, watching for file"
+        print(
+            f"{_log_prefix} Config file not found: {args.config} — starting with defaults, watching for file",
+            flush=True,
         )
     apply_config(config)
-    log("Starting browser trace service")
 
-    try:
-        asyncio.run(run(args.config))
-    except KeyboardInterrupt:
-        pass
+    if args.cmd == "cdp":
+        print(f"{_log_prefix} Starting browser trace service (CDP mode)", flush=True)
+        try:
+            asyncio.run(run(args.config))
+        except KeyboardInterrupt:
+            pass
+    elif args.cmd == "tinyproxy":
+        try:
+            run_tinyproxy(args.config)
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":
