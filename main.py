@@ -14,10 +14,13 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.request import urlopen
 
 import logfire
 import websockets
+
+import recording as rec
 
 
 @dataclass
@@ -33,6 +36,14 @@ class Config:
     # are still sent to Logfire (so the UI sees them) but are not tee'd to
     # stdout / Fly logs. Hot-reloadable via the config-file watcher.
     log_level: str = "INFO"
+    # Recording
+    record: bool = False
+    recording_storage: str = "local"  # "local" | "s3"
+    recording_dir: str = ""  # defaults to ./recordings
+    tigris_bucket: str = ""
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+    aws_endpoint_url: str = ""
 
     @classmethod
     def from_file(cls, path: str) -> "Config":
@@ -56,6 +67,13 @@ class Config:
             cdp_port=int(values.get("CDP_PORT", "9222")),
             traceparent=tp if tp else None,
             log_level=values.get("LOG_LEVEL", "INFO").upper(),
+            record=values.get("RECORD", "").lower() in ("1", "true", "yes"),
+            recording_storage=values.get("RECORDING_STORAGE", "local"),
+            recording_dir=values.get("RECORDING_DIR", ""),
+            tigris_bucket=values.get("TIGRIS_BUCKET", ""),
+            aws_access_key_id=values.get("AWS_ACCESS_KEY_ID", ""),
+            aws_secret_access_key=values.get("AWS_SECRET_ACCESS_KEY", ""),
+            aws_endpoint_url=values.get("AWS_ENDPOINT_URL", ""),
         )
 
 
@@ -174,6 +192,20 @@ def apply_config(new: Config) -> None:
         else:
             print(f"{_log_prefix} Traceparent cleared", flush=True)
 
+    recordings_dir = (
+        Path(new.recording_dir).resolve()
+        if new.recording_dir
+        else Path("recordings")
+    )
+    rec.configure(
+        recordings_dir=recordings_dir,
+        storage_backend=new.recording_storage,
+        tigris_bucket=new.tigris_bucket,
+        aws_access_key_id=new.aws_access_key_id,
+        aws_secret_access_key=new.aws_secret_access_key,
+        aws_endpoint_url=new.aws_endpoint_url,
+    )
+
 
 def get_browser_ws_url(host: str = "127.0.0.1", port: int = 9222) -> str:
     """Fetch the browser websocket URL from CDP /json/version endpoint."""
@@ -281,14 +313,17 @@ async def handle_event(ws, event: dict) -> None:
         target_info = params.get("targetInfo", {})
         sid = params.get("sessionId", "")
         if target_info.get("type") == "page" and sid:
+            target_id = target_info.get("targetId", "")
             sessions[sid] = {
-                "target_id": target_info.get("targetId", ""),
+                "target_id": target_id,
                 "main_frame_id": None,
                 "pending": [],
             }
             await send_cdp(ws, "Page.enable", session_id=sid)
             await send_cdp(ws, "Network.enable", session_id=sid)
             await send_cdp(ws, "Page.getFrameTree", session_id=sid)
+            if _config.record:
+                await rec.start_recording(sid, target_id, ws, send_cdp)
 
     elif method == "Target.detachedFromTarget":
         sid = params.get("sessionId", "")
@@ -298,6 +333,11 @@ async def handle_event(ws, event: dict) -> None:
         stale = [rid for rid, info in network_requests.items() if info.get("session_id") == sid]
         for rid in stale:
             network_requests.pop(rid, None)
+        if _config.record:
+            await rec.stop_recording(sid)
+
+    elif method == "Page.screencastFrame" and session_id:
+        rec.handle_screencast_frame(params, session_id, ws, send_cdp)
 
     elif method == "Page.frameNavigated" and session_id:
         frame = params.get("frame", {})
@@ -455,6 +495,7 @@ async def run(config_path: str) -> None:
                 await task
             except asyncio.CancelledError:
                 pass
+        await rec.stop_all()
         print(f"{_log_prefix} Shutting down", flush=True)
 
 
@@ -624,7 +665,7 @@ def main() -> None:
     # subcommand. If the first arg is not a known subcommand (and isn't a
     # flag), insert `cdp` so the existing chrome-live deployment keeps
     # working unchanged.
-    known_cmds = {"cdp", "tinyproxy"}
+    known_cmds = {"cdp", "tinyproxy", "recordings"}
     if (
         len(sys.argv) >= 2
         and sys.argv[1] not in known_cmds
@@ -649,6 +690,12 @@ def main() -> None:
     )
     p_tp.add_argument("config", help="Path to the config file")
 
+    p_rec = subparsers.add_parser(
+        "recordings",
+        help="List saved recordings",
+    )
+    p_rec.add_argument("config", nargs="?", default=".env", help="Path to the config file")
+
     args = parser.parse_args()
 
     # Pin the stdout / Logfire-message prefix to the actual subcommand so the
@@ -666,6 +713,8 @@ def main() -> None:
 
     if args.cmd == "cdp":
         print(f"{_log_prefix} Starting browser trace service (CDP mode)", flush=True)
+        if config.record:
+            print(f"{_log_prefix} Recording enabled", flush=True)
         try:
             asyncio.run(run(args.config))
         except KeyboardInterrupt:
@@ -675,6 +724,14 @@ def main() -> None:
             run_tinyproxy(args.config)
         except KeyboardInterrupt:
             pass
+    elif args.cmd == "recordings":
+        metas = rec.list_recordings()
+        if not metas:
+            print("No recordings found.")
+        else:
+            for m in metas:
+                duration = f"{m.duration_seconds:.1f}s" if m.duration_seconds is not None else "in progress"
+                print(f"{m.recording_id}  {m.started_at}  {duration}  {m.storage_key}")
 
 
 if __name__ == "__main__":

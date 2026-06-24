@@ -6,3 +6,4 @@ dependencies = ["websockets", "logfire"]
 
 [dependency-groups]
 dev = ["pyinstaller"]
+s3 = ["boto3"]
