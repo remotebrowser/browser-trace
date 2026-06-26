@@ -82,8 +82,6 @@ uv run main.py recordings .env
 
 Prints all recordings in the configured `RECORDING_DIR`, newest first.
 
-Recordings are captured when `RECORD=1` is set in the config. Each tab session is recorded from attach to detach (or 5-minute timeout), encoded to MP4 via ffmpeg at 854×480 / ~5fps / H.264 CRF 28.
-
 For S3 mode, set `RECORDING_STORAGE=s3` plus the Tigris env vars. For local mode (default) recordings land in `./recordings/` as `<id>.mp4` + `<id>.json` sidecar files.
 
 ## Building a standalone binary

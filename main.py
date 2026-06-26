@@ -37,7 +37,7 @@ class Config:
     # stdout / Fly logs. Hot-reloadable via the config-file watcher.
     log_level: str = "INFO"
     # Recording
-    record: bool = False
+    http_port: int = 8088
     recording_storage: str = "local"  # "local" | "s3"
     recording_dir: str = ""  # defaults to ./recordings
     tigris_bucket: str = ""
@@ -67,7 +67,7 @@ class Config:
             cdp_port=int(values.get("CDP_PORT", "9222")),
             traceparent=tp if tp else None,
             log_level=values.get("LOG_LEVEL", "INFO").upper(),
-            record=values.get("RECORD", "").lower() in ("1", "true", "yes"),
+            http_port=int(values.get("BROWSER_TRACE_PORT", "8088")),
             recording_storage=values.get("RECORDING_STORAGE", "local"),
             recording_dir=values.get("RECORDING_DIR", ""),
             tigris_bucket=values.get("TIGRIS_BUCKET", ""),
@@ -79,6 +79,9 @@ class Config:
 
 # Per-session state: maps sessionId -> {target_id, main_frame_id, pending}
 sessions: dict[str, dict] = {}
+
+# Reverse map: target_id -> session_id (for HTTP recording requests)
+target_sessions: dict[str, str] = {}
 
 # Maps CDP message ID -> (method, sessionId) for response correlation
 pending_commands: dict[int, tuple[str, str | None]] = {}
@@ -319,22 +322,22 @@ async def handle_event(ws, event: dict) -> None:
                 "main_frame_id": None,
                 "pending": [],
             }
+            target_sessions[target_id] = sid
             await send_cdp(ws, "Page.enable", session_id=sid)
             await send_cdp(ws, "Network.enable", session_id=sid)
             await send_cdp(ws, "Page.getFrameTree", session_id=sid)
-            if _config.record:
-                await rec.start_recording(sid, target_id, ws, send_cdp)
 
     elif method == "Target.detachedFromTarget":
         sid = params.get("sessionId", "")
-        sessions.pop(sid, None)
+        session = sessions.pop(sid, None)
+        if session:
+            target_sessions.pop(session.get("target_id", ""), None)
         # Drop any in-flight Document requests scoped to this dying session
         # so network_requests can't grow unbounded across tab churn.
         stale = [rid for rid, info in network_requests.items() if info.get("session_id") == sid]
         for rid in stale:
             network_requests.pop(rid, None)
-        if _config.record:
-            await rec.stop_recording(sid)
+        await rec.stop_recording(sid)
 
     elif method == "Page.screencastFrame" and session_id:
         rec.handle_screencast_frame(params, session_id, ws, send_cdp)
@@ -443,6 +446,8 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
         print(f"{_log_prefix} Connecting to {ws_url}", flush=True)
         try:
             async with websockets.connect(ws_url, max_size=50 * 1024 * 1024) as ws:
+                global _current_ws
+                _current_ws = ws
                 print(f"{_log_prefix} Connected to CDP", flush=True)
 
                 await send_cdp(ws, "Target.setDiscoverTargets", {"discover": True})
@@ -469,10 +474,118 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
                     await handle_event(ws, event)
         except (OSError, websockets.exceptions.WebSocketException) as exc:
             print(f"{_log_prefix} CDP connection lost ({exc}) — retrying in {poll_interval}s", flush=True)
+            _current_ws = None
             sessions.clear()
+            target_sessions.clear()
             pending_commands.clear()
             network_requests.clear()
             await asyncio.sleep(poll_interval)
+
+
+async def _send_json(writer: asyncio.StreamWriter, status: str, body: bytes) -> None:
+    response = (
+        f"HTTP/1.1 {status}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    )
+    writer.write(response.encode() + body)
+    await writer.drain()
+
+
+async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Minimal HTTP/1.1 handler for recording control and playback endpoints."""
+    try:
+        raw = await reader.read(4096)
+        if not raw:
+            return
+        request_line = raw.split(b"\r\n", 1)[0].decode()
+        parts = request_line.split()
+        if len(parts) < 2:
+            return
+        method, path = parts[0], parts[1]
+
+        # POST /record/start  — start recording all active sessions
+        if method == "POST" and path == "/record/start":
+            if _current_ws is None:
+                await _send_json(writer, "503 Service Unavailable", b'{"error":"CDP not connected"}')
+                return
+            if not sessions:
+                await _send_json(writer, "404 Not Found", b'{"error":"no active sessions"}')
+                return
+            recording_ids = {}
+            for sid, session in sessions.items():
+                try:
+                    recording_id = await rec.start_recording(
+                        sid, session["target_id"], _current_ws, send_cdp
+                    )
+                    recording_ids[session["target_id"]] = recording_id
+                except Exception as e:
+                    print(f"{_log_prefix} failed to start recording for session {sid[:8]}: {e}", flush=True)
+            await _send_json(writer, "200 OK", json.dumps({"recording_ids": recording_ids}).encode())
+
+        # POST /record/stop  — stop all active session recordings
+        elif method == "POST" and path == "/record/stop":
+            results = []
+            for sid in list(sessions.keys()):
+                meta = await rec.stop_recording(sid)
+                if meta and meta.storage_key:
+                    results.append({
+                        "recording_id": meta.recording_id,
+                        "storage_key": meta.storage_key,
+                        "duration_seconds": meta.duration_seconds,
+                    })
+            await _send_json(writer, "200 OK", json.dumps({"recordings": results}).encode())
+
+        # GET /recordings
+        elif method == "GET" and path == "/recordings":
+            metas = rec.list_recordings()
+            body = json.dumps([{
+                "recording_id": m.recording_id,
+                "started_at": m.started_at,
+                "duration_seconds": m.duration_seconds,
+                "storage_key": m.storage_key,
+            } for m in metas]).encode()
+            await _send_json(writer, "200 OK", body)
+
+        # GET /recordings/<id>
+        elif method == "GET" and path.startswith("/recordings/"):
+            recording_id = path.strip("/").split("/", 1)[1]
+            mp4_path = rec.get_recording_path(recording_id)
+            if mp4_path is None:
+                await _send_json(writer, "404 Not Found", b'{"error":"not found"}')
+            else:
+                writer.write(
+                    f"HTTP/1.1 200 OK\r\n"
+                    f"Content-Type: video/mp4\r\n"
+                    f"Content-Length: {mp4_path.stat().st_size}\r\n"
+                    "Connection: close\r\n\r\n"
+                    .encode()
+                )
+                await writer.drain()
+                with open(mp4_path, "rb") as f:
+                    while chunk := f.read(65536):
+                        writer.write(chunk)
+                        await writer.drain()
+
+        else:
+            await _send_json(writer, "404 Not Found", b'{"error":"not found"}')
+
+    finally:
+        writer.close()
+
+
+# Holds the active CDP websocket so the HTTP handler can call send_cdp on it.
+# Set when connected, cleared on disconnect.
+_current_ws = None
+
+
+async def run_http_server(host: str = "0.0.0.0") -> None:
+    port = _config.http_port
+    server = await asyncio.start_server(handle_http, host, port)
+    print(f"{_log_prefix} HTTP server listening on {host}:{port}", flush=True)
+    async with server:
+        await server.serve_forever()
 
 
 async def run(config_path: str) -> None:
@@ -484,12 +597,13 @@ async def run(config_path: str) -> None:
 
     watcher = asyncio.create_task(watch_config(config_path))
     cdp_task = asyncio.create_task(connect_cdp())
+    http_task = asyncio.create_task(run_http_server())
     try:
         # Wait until a signal fires or cdp_task ends on its own
         stop_future = asyncio.ensure_future(stop_event.wait())
         await asyncio.wait([cdp_task, stop_future], return_when=asyncio.FIRST_COMPLETED)
     finally:
-        for task in (watcher, cdp_task):
+        for task in (watcher, cdp_task, http_task):
             task.cancel()
             try:
                 await task
@@ -713,8 +827,6 @@ def main() -> None:
 
     if args.cmd == "cdp":
         print(f"{_log_prefix} Starting browser trace service (CDP mode)", flush=True)
-        if config.record:
-            print(f"{_log_prefix} Recording enabled", flush=True)
         try:
             asyncio.run(run(args.config))
         except KeyboardInterrupt:

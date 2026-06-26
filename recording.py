@@ -3,15 +3,16 @@
 Captures JPEG frames from a CDP session, encodes them to MP4 via ffmpeg,
 and stores them locally or in S3-compatible storage (Fly Tigris).
 
-Usage: call start_recording(session_id, ws) when a tab attaches,
-stop_recording(session_id) when it detaches or on shutdown.
+Recording is triggered via the HTTP API (POST /record/start),
+which starts a screencast on every active CDP session simultaneously.
 """
 
 import asyncio
 import base64
 import json
-import os
+import secrets
 import shutil
+import string
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -31,7 +32,6 @@ _SCREENCAST_MAX_HEIGHT = 480
 class RecordingMeta:
     recording_id: str
     session_id: str
-    target_id: str
     started_at: str  # ISO 8601
     stopped_at: str | None
     duration_seconds: float | None
@@ -83,7 +83,6 @@ async def start_recording(session_id: str, target_id: str, ws, send_cdp_fn) -> s
     """Start a screencast recording for the given CDP session.
 
     Returns the recording_id. No-ops (returns existing id) if already recording.
-    send_cdp_fn is the module-level send_cdp coroutine from main.py.
     """
     if session_id in _active:
         return _active[session_id].meta.recording_id
@@ -95,7 +94,6 @@ async def start_recording(session_id: str, target_id: str, ws, send_cdp_fn) -> s
     meta = RecordingMeta(
         recording_id=recording_id,
         session_id=session_id,
-        target_id=target_id,
         started_at=datetime.now(timezone.utc).isoformat(),
         stopped_at=None,
         duration_seconds=None,
@@ -138,22 +136,21 @@ async def start_recording(session_id: str, target_id: str, ws, send_cdp_fn) -> s
 
 def handle_screencast_frame(event_params: dict, session_id: str, ws, send_cdp_fn) -> None:
     """Call this from the CDP event loop when Page.screencastFrame arrives."""
-    rec = _active.get(session_id)
-    if rec is None:
+    recording = _active.get(session_id)
+    if recording is None:
         return
 
     data = event_params.get("data", "")
     cdp_session_id = event_params.get("sessionId")
 
-    frame_path = rec.frames_dir / f"{rec.frame_count:06d}.jpg"
+    frame_path = recording.frames_dir / f"{recording.frame_count:06d}.jpg"
     try:
         frame_path.write_bytes(base64.b64decode(data))
-        rec.frame_count += 1
+        recording.frame_count += 1
     except Exception as e:
         print(f"[recording] frame write failed: {e}", flush=True)
         return
 
-    # Ack the frame — fire-and-forget via asyncio task
     if cdp_session_id is not None:
         asyncio.create_task(
             send_cdp_fn(
@@ -179,10 +176,7 @@ async def stop_recording(session_id: str) -> RecordingMeta | None:
 
     actual_frames = len(list(recording.frames_dir.glob("*.jpg")))
     if actual_frames == 0:
-        print(
-            f"[recording] {recording.meta.recording_id} has no frames, discarding",
-            flush=True,
-        )
+        print(f"[recording] {recording.meta.recording_id} has no frames, discarding", flush=True)
         shutil.rmtree(recording.frames_dir, ignore_errors=True)
         return recording.meta
 
@@ -204,16 +198,17 @@ async def stop_recording(session_id: str) -> RecordingMeta | None:
 
 
 async def stop_all() -> None:
-    """Stop all active recordings (called on shutdown)."""
     for session_id in list(_active.keys()):
         await stop_recording(session_id)
 
 
 def list_recordings() -> list[RecordingMeta]:
+    fields = {f for f in RecordingMeta.__dataclass_fields__}
     metas = []
     for p in _recordings_dir.glob("*.json"):
         try:
-            metas.append(RecordingMeta(**json.loads(p.read_text())))
+            data = {k: v for k, v in json.loads(p.read_text()).items() if k in fields}
+            metas.append(RecordingMeta(**data))
         except Exception:
             continue
     return sorted(metas, key=lambda m: m.started_at, reverse=True)
@@ -236,8 +231,7 @@ async def _encode_and_store(recording: _ActiveRecording) -> str:
     mp4_path = recording.frames_dir / f"{recording_id}.mp4"
 
     cmd = [
-        "ffmpeg",
-        "-y",
+        "ffmpeg", "-y",
         "-framerate", str(_SCREENCAST_FPS),
         "-i", str(recording.frames_dir / "%06d.jpg"),
         "-vf", "crop=trunc(iw/2)*2:trunc(ih/2)*2",
@@ -255,9 +249,7 @@ async def _encode_and_store(recording: _ActiveRecording) -> str:
     _, stderr = await proc.communicate()
 
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg failed for {recording_id}: {stderr.decode()[-500:]}"
-        )
+        raise RuntimeError(f"ffmpeg failed for {recording_id}: {stderr.decode()[-500:]}")
 
     if _storage_backend == "s3":
         return await asyncio.to_thread(_s3_upload_file, str(mp4_path), f"{recording_id}.mp4")
@@ -296,7 +288,5 @@ def _s3_put_object(key: str, body: bytes) -> None:
 
 
 def _new_id() -> str:
-    import secrets
-    import string
     alphabet = string.ascii_lowercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(12))
