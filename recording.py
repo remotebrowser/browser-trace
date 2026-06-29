@@ -79,7 +79,7 @@ def configure(
     _aws_endpoint_url = aws_endpoint_url
 
 
-async def start_recording(session_id: str, target_id: str, ws, send_cdp_fn) -> str:
+async def start_recording(session_id: str, target_id: str, ws, send_cdp_fn, browser_id: str = "") -> str:
     """Start a screencast recording for the given CDP session.
 
     Returns the recording_id. No-ops (returns existing id) if already recording.
@@ -87,7 +87,7 @@ async def start_recording(session_id: str, target_id: str, ws, send_cdp_fn) -> s
     if session_id in _active:
         return _active[session_id].meta.recording_id
 
-    recording_id = _new_id()
+    recording_id = _new_id(browser_id)
     frames_dir = Path(tempfile.mkdtemp(prefix=f"bt-rec-{recording_id}-"))
     started_ts = asyncio.get_event_loop().time()
 
@@ -287,6 +287,10 @@ def _s3_put_object(key: str, body: bytes) -> None:
     _s3_client().put_object(Bucket=_tigris_bucket, Key=key, Body=body)
 
 
-def _new_id() -> str:
+def _new_id(browser_id: str = "") -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    if browser_id:
+        return f"{browser_id}_{ts}"
     alphabet = string.ascii_lowercase + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(12))
+    suffix = "".join(secrets.choice(alphabet) for _ in range(8))
+    return f"{ts}_{suffix}"

@@ -513,11 +513,18 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             if not sessions:
                 await _send_json(writer, "404 Not Found", b'{"error":"no active sessions"}')
                 return
+            body_start = raw.find(b"\r\n\r\n")
+            browser_id = ""
+            if body_start != -1:
+                try:
+                    browser_id = json.loads(raw[body_start + 4:]).get("browser_id", "")
+                except Exception:
+                    pass
             recording_ids = {}
             for sid, session in sessions.items():
                 try:
                     recording_id = await rec.start_recording(
-                        sid, session["target_id"], _current_ws, send_cdp
+                        sid, session["target_id"], _current_ws, send_cdp, browser_id
                     )
                     recording_ids[session["target_id"]] = recording_id
                 except Exception as e:
