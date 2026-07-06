@@ -37,6 +37,10 @@ class RecordingMeta:
     duration_seconds: float | None
     storage_key: str  # relative path (local) or S3 key (s3)
     storage_backend: str  # "local" | "s3"
+    # Which tab this recording came from. Defaulted so sidecar JSON written by
+    # older builds (without these fields) still loads in list_recordings().
+    target_id: str = ""
+    url: str = ""
 
 
 @dataclass
@@ -79,15 +83,23 @@ def configure(
     _aws_endpoint_url = aws_endpoint_url
 
 
-async def start_recording(session_id: str, target_id: str, ws, send_cdp_fn, browser_id: str = "") -> str:
+async def start_recording(
+    session_id: str,
+    target_id: str,
+    ws,
+    send_cdp_fn,
+    browser_id: str = "",
+    url: str = "",
+) -> str:
     """Start a screencast recording for the given CDP session.
 
-    Returns the recording_id. No-ops (returns existing id) if already recording.
+    Returns the recording_id. No-ops (returns existing id) if already recording,
+    so a tab re-focused during one recording period resumes into the same file.
     """
     if session_id in _active:
         return _active[session_id].meta.recording_id
 
-    recording_id = _new_id(browser_id)
+    recording_id = _new_id(browser_id, target_id)
     frames_dir = Path(tempfile.mkdtemp(prefix=f"bt-rec-{recording_id}-"))
     started_ts = asyncio.get_event_loop().time()
 
@@ -99,6 +111,8 @@ async def start_recording(session_id: str, target_id: str, ws, send_cdp_fn, brow
         duration_seconds=None,
         storage_key="",
         storage_backend=_storage_backend,
+        target_id=target_id,
+        url=url,
     )
 
     recording = _ActiveRecording(
@@ -287,10 +301,12 @@ def _s3_put_object(key: str, body: bytes) -> None:
     _s3_client().put_object(Bucket=_tigris_bucket, Key=key, Body=body)
 
 
-def _new_id(browser_id: str = "") -> str:
+def _new_id(browser_id: str = "", target_id: str = "") -> str:
+    # Fold target_id in so concurrent tabs never share an id (which would make
+    # their <id>.mp4 / <id>.json overwrite each other). A short random suffix
+    # keeps ids unique even for the same tab recorded twice within one second.
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    if browser_id:
-        return f"{browser_id}_{ts}"
     alphabet = string.ascii_lowercase + string.digits
-    suffix = "".join(secrets.choice(alphabet) for _ in range(8))
-    return f"{ts}_{suffix}"
+    suffix = "".join(secrets.choice(alphabet) for _ in range(6))
+    parts = [p for p in (browser_id, ts, target_id[:8].lower(), suffix) if p]
+    return "_".join(parts)

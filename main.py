@@ -83,6 +83,14 @@ sessions: dict[str, dict] = {}
 # Reverse map: target_id -> session_id (for HTTP recording requests)
 target_sessions: dict[str, str] = {}
 
+# Recording "armed" state. Set true by POST /record/start and false by
+# /record/stop. While armed, any tab that attaches (Target.attachedToTarget) is
+# auto-recorded, so tabs opened mid-session are captured without a second API
+# call. _recording_browser_id carries the browser_id from the arming call so
+# new-tab recordings are named consistently.
+_recording_armed: bool = False
+_recording_browser_id: str = ""
+
 # Maps CDP message ID -> (method, sessionId) for response correlation
 pending_commands: dict[int, tuple[str, str | None]] = {}
 
@@ -317,8 +325,10 @@ async def handle_event(ws, event: dict) -> None:
         sid = params.get("sessionId", "")
         if target_info.get("type") == "page" and sid:
             target_id = target_info.get("targetId", "")
+            url = target_info.get("url", "")
             sessions[sid] = {
                 "target_id": target_id,
+                "url": url,
                 "main_frame_id": None,
                 "pending": [],
             }
@@ -326,6 +336,19 @@ async def handle_event(ws, event: dict) -> None:
             await send_cdp(ws, "Page.enable", session_id=sid)
             await send_cdp(ws, "Network.enable", session_id=sid)
             await send_cdp(ws, "Page.getFrameTree", session_id=sid)
+            # If recording is armed, capture this tab too — covers tabs opened
+            # after /record/start (DoD-2). start_recording no-ops if this
+            # session is somehow already recording.
+            if _recording_armed:
+                try:
+                    await rec.start_recording(
+                        sid, target_id, ws, send_cdp, _recording_browser_id, url
+                    )
+                except Exception as e:
+                    print(
+                        f"{_log_prefix} failed to auto-record new tab {sid[:8]}: {e}",
+                        flush=True,
+                    )
 
     elif method == "Target.detachedFromTarget":
         sid = params.get("sessionId", "")
@@ -475,6 +498,11 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
         except (OSError, websockets.exceptions.WebSocketException) as exc:
             print(f"{_log_prefix} CDP connection lost ({exc}) — retrying in {poll_interval}s", flush=True)
             _current_ws = None
+            # Finalize any in-flight recordings (encode from frames already on
+            # disk) before dropping session state, so they aren't orphaned until
+            # the 5-min timeout fires (DoD-5). Recording stays armed, so tabs
+            # re-recorded on reconnect resume capture.
+            await rec.stop_all()
             sessions.clear()
             target_sessions.clear()
             pending_commands.clear()
@@ -495,6 +523,7 @@ async def _send_json(writer: asyncio.StreamWriter, status: str, body: bytes) -> 
 
 async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     """Minimal HTTP/1.1 handler for recording control and playback endpoints."""
+    global _recording_armed, _recording_browser_id
     try:
         raw = await reader.read(4096)
         if not raw:
@@ -520,11 +549,15 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                     browser_id = json.loads(raw[body_start + 4:]).get("browser_id", "")
                 except Exception:
                     pass
+            # Arm recording so tabs opened later are auto-captured (DoD-2).
+            _recording_armed = True
+            _recording_browser_id = browser_id
             recording_ids = {}
             for sid, session in sessions.items():
                 try:
                     recording_id = await rec.start_recording(
-                        sid, session["target_id"], _current_ws, send_cdp, browser_id
+                        sid, session["target_id"], _current_ws, send_cdp,
+                        browser_id, session.get("url", ""),
                     )
                     recording_ids[session["target_id"]] = recording_id
                 except Exception as e:
@@ -533,6 +566,9 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 
         # POST /record/stop  — stop all active session recordings
         elif method == "POST" and path == "/record/stop":
+            # Disarm first so a tab attaching mid-stop isn't auto-recorded.
+            _recording_armed = False
+            _recording_browser_id = ""
             results = []
             for sid in list(sessions.keys()):
                 meta = await rec.stop_recording(sid)
@@ -552,6 +588,8 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 "started_at": m.started_at,
                 "duration_seconds": m.duration_seconds,
                 "storage_key": m.storage_key,
+                "target_id": m.target_id,
+                "url": m.url,
             } for m in metas]).encode()
             await _send_json(writer, "200 OK", body)
 
@@ -850,7 +888,9 @@ def main() -> None:
         else:
             for m in metas:
                 duration = f"{m.duration_seconds:.1f}s" if m.duration_seconds is not None else "in progress"
-                print(f"{m.recording_id}  {m.started_at}  {duration}  {m.storage_key}")
+                tab = f"  tab={m.target_id[:8]}" if m.target_id else ""
+                url = f"  {m.url}" if m.url else ""
+                print(f"{m.recording_id}  {m.started_at}  {duration}  {m.storage_key}{tab}{url}")
 
 
 if __name__ == "__main__":
