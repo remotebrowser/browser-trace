@@ -52,6 +52,10 @@ class _ActiveRecording:
     frame_count: int
     timeout_task: asyncio.Task[None]
     started_ts: float
+    # Held so stop_recording can tell Chrome to stop the screencast for this
+    # session (best-effort). ws may be stale/closed by stop time (reconnect).
+    ws: object
+    send_cdp_fn: object
 
 
 # session_id -> active recording
@@ -124,6 +128,8 @@ async def start_recording(
         frame_count=0,
         timeout_task=asyncio.create_task(_timeout_stop(session_id)),
         started_ts=started_ts,
+        ws=ws,
+        send_cdp_fn=send_cdp_fn,
     )
     _active[session_id] = recording
 
@@ -196,6 +202,18 @@ async def stop_recording(session_id: str) -> RecordingMeta | None:
         return None
 
     recording.timeout_task.cancel()
+
+    # Best-effort: stop the Chrome-side screencast for this session. Without this
+    # the screencast keeps running after we stop recording, so a later
+    # startScreencast on the same session (e.g. a second /record/start cycle)
+    # gets a stale/duplicated stream and stalls. Harmless no-op if the ws is
+    # already closed (reconnect) or the target detached.
+    try:
+        await recording.send_cdp_fn(
+            recording.ws, "Page.stopScreencast", session_id=session_id
+        )
+    except Exception:
+        pass
 
     elapsed = asyncio.get_event_loop().time() - recording.started_ts
     recording.meta.stopped_at = datetime.now(timezone.utc).isoformat()
