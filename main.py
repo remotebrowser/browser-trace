@@ -630,10 +630,14 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 _current_ws = None
 
 
-async def run_http_server(host: str = "0.0.0.0") -> None:
+# Bind IPv6 (dual-stack) rather than "0.0.0.0". Fly's private 6PN network is
+# IPv6-only, so an IPv4-only bind is unreachable from other machines (e.g.
+# flyfleet proxying the recording API over the 6PN IP). "::" accepts both IPv6
+# and, via dual-stack, IPv4 (localhost) — matching how the cdp-proxy socat binds.
+async def run_http_server(host: str = "::") -> None:
     port = _config.http_port
     server = await asyncio.start_server(handle_http, host, port)
-    print(f"{_log_prefix} HTTP server listening on {host}:{port}", flush=True)
+    print(f"{_log_prefix} HTTP server listening on [{host}]:{port}", flush=True)
     async with server:
         await server.serve_forever()
 
