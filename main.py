@@ -589,6 +589,7 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 "duration_seconds": m.duration_seconds,
                 "storage_key": m.storage_key,
                 "target_id": m.target_id,
+                "browser_id": m.browser_id,
                 "url": m.url,
             } for m in metas]).encode()
             await _send_json(writer, "200 OK", body)
@@ -888,9 +889,10 @@ def main() -> None:
         else:
             for m in metas:
                 duration = f"{m.duration_seconds:.1f}s" if m.duration_seconds is not None else "in progress"
+                browser = f"  browser={m.browser_id}" if m.browser_id else ""
                 tab = f"  tab={m.target_id[:8]}" if m.target_id else ""
                 url = f"  {m.url}" if m.url else ""
-                print(f"{m.recording_id}  {m.started_at}  {duration}  {m.storage_key}{tab}{url}")
+                print(f"{m.recording_id}  {m.started_at}  {duration}  {m.storage_key}{browser}{tab}{url}")
 
 
 if __name__ == "__main__":

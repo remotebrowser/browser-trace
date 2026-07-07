@@ -37,10 +37,12 @@ class RecordingMeta:
     duration_seconds: float | None
     storage_key: str  # relative path (local) or S3 key (s3)
     storage_backend: str  # "local" | "s3"
-    # Which tab this recording came from. Defaulted so sidecar JSON written by
-    # older builds (without these fields) still loads in list_recordings().
+    # Tab + browser identity for triage: an error elsewhere (e.g. remotebrowser)
+    # carries the same (browser_id, target_id) and can be joined to this
+    # recording. Defaulted so sidecar JSON written by older builds still loads.
     target_id: str = ""
     url: str = ""
+    browser_id: str = ""
 
 
 @dataclass
@@ -113,6 +115,7 @@ async def start_recording(
         storage_backend=_storage_backend,
         target_id=target_id,
         url=url,
+        browser_id=browser_id,
     )
 
     recording = _ActiveRecording(
@@ -125,6 +128,16 @@ async def start_recording(
     _active[session_id] = recording
 
     try:
+        # Make this tab render as if focused, even while backgrounded. Chrome
+        # doesn't paint hidden tabs, so without this only the foreground tab
+        # produces screencast frames; with it every armed tab records
+        # simultaneously and continuously (no gaps while backgrounded).
+        await send_cdp_fn(
+            ws,
+            "Emulation.setFocusEmulationEnabled",
+            {"enabled": True},
+            session_id=session_id,
+        )
         await send_cdp_fn(
             ws,
             "Page.startScreencast",
