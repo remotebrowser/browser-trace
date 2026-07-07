@@ -42,7 +42,7 @@ CDP_PORT=9222
 | `CDP_PORT`           | Chrome DevTools Protocol port (default: `9222`)  | No       |
 | `RECORD`             | Set to `1` to enable screen recording for all tabs | No     |
 | `RECORDING_STORAGE`  | `local` (default) or `s3` (Fly Tigris)          | No       |
-| `RECORDING_DIR`      | Directory for local recordings (default: `./recordings`) | No |
+| `RECORDING_DIR`      | Directory for local recordings (default: `/tmp/recordings`) | No |
 | `TIGRIS_BUCKET`      | Tigris bucket name (s3 mode only)                | No       |
 | `AWS_ACCESS_KEY_ID`  | Tigris key id (s3 mode only)                     | No       |
 | `AWS_SECRET_ACCESS_KEY` | Tigris secret (s3 mode only)                  | No       |

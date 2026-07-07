@@ -39,7 +39,7 @@ class Config:
     # Recording
     http_port: int = 8088
     recording_storage: str = "local"  # "local" | "s3"
-    recording_dir: str = ""  # defaults to ./recordings
+    recording_dir: str = ""  # defaults to /tmp/recordings
     tigris_bucket: str = ""
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
@@ -206,7 +206,7 @@ def apply_config(new: Config) -> None:
     recordings_dir = (
         Path(new.recording_dir).resolve()
         if new.recording_dir
-        else Path("recordings")
+        else Path("/tmp/recordings")
     )
     rec.configure(
         recordings_dir=recordings_dir,
@@ -215,6 +215,10 @@ def apply_config(new: Config) -> None:
         aws_access_key_id=new.aws_access_key_id,
         aws_secret_access_key=new.aws_secret_access_key,
         aws_endpoint_url=new.aws_endpoint_url,
+    )
+    print(
+        f"{_log_prefix} Recordings dir: {recordings_dir} (storage={new.recording_storage})",
+        flush=True,
     )
 
 
