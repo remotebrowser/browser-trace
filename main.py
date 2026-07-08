@@ -41,12 +41,7 @@ class Config:
     http_port: int = 8088
     record: bool = False
     browser_id: str = ""
-    recording_storage: str = "local"  # "local" | "s3"
     recording_dir: str = ""  # defaults to /tmp/recordings
-    tigris_bucket: str = ""
-    aws_access_key_id: str = ""
-    aws_secret_access_key: str = ""
-    aws_endpoint_url: str = ""
 
     @classmethod
     def from_file(cls, path: str) -> "Config":
@@ -73,12 +68,7 @@ class Config:
             http_port=int(values.get("BROWSER_TRACE_PORT", "8088")),
             record=values.get("RECORD", "0") == "1",
             browser_id=values.get("BROWSER_ID", ""),
-            recording_storage=values.get("RECORDING_STORAGE", "local"),
             recording_dir=values.get("RECORDING_DIR", ""),
-            tigris_bucket=values.get("TIGRIS_BUCKET", ""),
-            aws_access_key_id=values.get("AWS_ACCESS_KEY_ID", ""),
-            aws_secret_access_key=values.get("AWS_SECRET_ACCESS_KEY", ""),
-            aws_endpoint_url=values.get("AWS_ENDPOINT_URL", ""),
         )
 
 
@@ -206,18 +196,8 @@ def apply_config(new: Config) -> None:
         if new.recording_dir
         else Path("/tmp/recordings")
     )
-    rec.configure(
-        recordings_dir=recordings_dir,
-        storage_backend=new.recording_storage,
-        tigris_bucket=new.tigris_bucket,
-        aws_access_key_id=new.aws_access_key_id,
-        aws_secret_access_key=new.aws_secret_access_key,
-        aws_endpoint_url=new.aws_endpoint_url,
-    )
-    print(
-        f"{_log_prefix} Recordings dir: {recordings_dir} (storage={new.recording_storage})",
-        flush=True,
-    )
+    rec.configure(recordings_dir=recordings_dir)
+    print(f"{_log_prefix} Recordings dir: {recordings_dir}", flush=True)
 
 
 def get_browser_ws_url(host: str = "127.0.0.1", port: int = 9222) -> str:

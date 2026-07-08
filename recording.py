@@ -1,7 +1,7 @@
 """Browser session recording via CDP screencast.
 
 Captures JPEG frames from a CDP session, encodes them to MP4 via ffmpeg,
-and stores them locally or in S3-compatible storage (Fly Tigris).
+and stores them on the local filesystem.
 
 Recording is always-on, gated by the RECORD config flag. A screencast is
 started automatically for every tab the instant it attaches (Target.attachedToTarget),
@@ -19,7 +19,6 @@ import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 
 _SCREENCAST_FPS = 5
@@ -36,8 +35,7 @@ class RecordingMeta:
     started_at: str  # ISO 8601
     stopped_at: str | None
     duration_seconds: float | None
-    storage_key: str  # relative path (local) or S3 key (s3)
-    storage_backend: str  # "local" | "s3"
+    storage_key: str  # filename relative to the recordings dir, e.g. <id>.mp4
     # Tab + browser identity for triage: an error elsewhere (e.g. remotebrowser)
     # carries the same (browser_id, target_id) and can be joined to this
     # recording. Defaulted so sidecar JSON written by older builds still loads.
@@ -63,30 +61,12 @@ _active: dict[str, _ActiveRecording] = {}
 
 # Injected at startup from Config
 _recordings_dir: Path = Path("recordings")
-_storage_backend: str = "local"
-_tigris_bucket: str = ""
-_aws_access_key_id: str = ""
-_aws_secret_access_key: str = ""
-_aws_endpoint_url: str = ""
 
 
-def configure(
-    recordings_dir: Path,
-    storage_backend: str = "local",
-    tigris_bucket: str = "",
-    aws_access_key_id: str = "",
-    aws_secret_access_key: str = "",
-    aws_endpoint_url: str = "",
-) -> None:
-    global _recordings_dir, _storage_backend, _tigris_bucket
-    global _aws_access_key_id, _aws_secret_access_key, _aws_endpoint_url
+def configure(recordings_dir: Path) -> None:
+    global _recordings_dir
     _recordings_dir = recordings_dir
     _recordings_dir.mkdir(parents=True, exist_ok=True)
-    _storage_backend = storage_backend
-    _tigris_bucket = tigris_bucket
-    _aws_access_key_id = aws_access_key_id
-    _aws_secret_access_key = aws_secret_access_key
-    _aws_endpoint_url = aws_endpoint_url
 
 
 async def start_recording(
@@ -116,7 +96,6 @@ async def start_recording(
         stopped_at=None,
         duration_seconds=None,
         storage_key="",
-        storage_backend=_storage_backend,
         target_id=target_id,
         url=url,
         browser_id=browser_id,
@@ -285,9 +264,6 @@ async def _encode_and_store(recording: _ActiveRecording) -> str:
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed for {recording_id}: {stderr.decode()[-500:]}")
 
-    if _storage_backend == "s3":
-        return await asyncio.to_thread(_s3_upload_file, str(mp4_path), f"{recording_id}.mp4")
-
     dest = _recordings_dir / f"{recording_id}.mp4"
     shutil.move(str(mp4_path), dest)
     return f"{recording_id}.mp4"
@@ -295,30 +271,7 @@ async def _encode_and_store(recording: _ActiveRecording) -> str:
 
 async def _write_meta(meta: RecordingMeta) -> None:
     payload = json.dumps(asdict(meta), indent=2)
-    if _storage_backend == "s3":
-        await asyncio.to_thread(_s3_put_object, f"{meta.recording_id}.json", payload.encode())
-        return
     (_recordings_dir / f"{meta.recording_id}.json").write_text(payload)
-
-
-def _s3_client() -> Any:
-    import boto3  # type: ignore[import-untyped]
-
-    return boto3.client(
-        "s3",
-        endpoint_url=_aws_endpoint_url or None,
-        aws_access_key_id=_aws_access_key_id or None,
-        aws_secret_access_key=_aws_secret_access_key or None,
-    )
-
-
-def _s3_upload_file(file_path: str, key: str) -> str:
-    _s3_client().upload_file(file_path, _tigris_bucket, key)
-    return key
-
-
-def _s3_put_object(key: str, body: bytes) -> None:
-    _s3_client().put_object(Bucket=_tigris_bucket, Key=key, Body=body)
 
 
 def _new_id(browser_id: str = "", target_id: str = "") -> str:

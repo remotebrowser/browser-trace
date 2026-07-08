@@ -42,12 +42,7 @@ CDP_PORT=9222
 | `CDP_PORT`              | Chrome DevTools Protocol port (default: `9222`)                                                                                                                                                                                                                                                                             | No       |
 | `RECORD`                | Set to `1` to record every tab (always-on; started automatically per tab). Default off.                                                                                                                                                                                                                                     | No       |
 | `BROWSER_ID`            | Browser id tagged onto every recording                                                                                                                                                                                                                                                                                      | No       |
-| `RECORDING_STORAGE`     | `local` (default) or `s3` (Fly Tigris)                                                                                                                                                                                                                                                                                      | No       |
-| `RECORDING_DIR`         | Directory for local recordings (default: `/tmp/recordings`)                                                                                                                                                                                                                                                                 | No       |
-| `TIGRIS_BUCKET`         | Tigris bucket name (s3 mode only)                                                                                                                                                                                                                                                                                           | No       |
-| `AWS_ACCESS_KEY_ID`     | Tigris key id (s3 mode only)                                                                                                                                                                                                                                                                                                | No       |
-| `AWS_SECRET_ACCESS_KEY` | Tigris secret (s3 mode only)                                                                                                                                                                                                                                                                                                | No       |
-| `AWS_ENDPOINT_URL`      | Tigris endpoint, e.g. `https://fly.storage.tigris.dev` (s3 mode only)                                                                                                                                                                                                                                                       | No       |
+| `RECORDING_DIR`         | Directory for recordings (default: `/tmp/recordings`)                                                                                                                                                                                                                                                                       | No       |
 
 The config file is watched for changes every 2 seconds, so `LOGFIRE_TRACEPARENT` can be updated at runtime without restarting the service.
 
@@ -83,7 +78,7 @@ uv run main.py recordings .env
 
 Prints all recordings in the configured `RECORDING_DIR`, newest first.
 
-For S3 mode, set `RECORDING_STORAGE=s3` plus the Tigris env vars. For local mode (default) recordings land in `./recordings/` as `<id>.mp4` + `<id>.json` sidecar files.
+Recordings land in `RECORDING_DIR` as `<id>.mp4` + `<id>.json` sidecar files.
 
 ## Building a standalone binary
 
