@@ -102,6 +102,7 @@ _config = Config()
 _log_prefix: str = "[browser-trace]"
 
 
+
 def _emit_with_traceparent(log_func, msg: str, attrs: dict) -> None:
     if _config.traceparent:
         with logfire.attach_context({"traceparent": _config.traceparent}):
@@ -131,7 +132,8 @@ def emit_cdp_event(
     attrs = {k: v for k, v in attrs.items() if v is not None}
     log_func = (
         logfire.error
-        if error_text is not None or (status_code is not None and status_code >= 400)
+        if error_text is not None
+        or (status_code is not None and status_code >= 400)
         else logfire.info
     )
     msg = f"{_log_prefix} {event}"
@@ -184,10 +186,7 @@ def apply_config(new: Config) -> None:
 
     if new.traceparent != old.traceparent:
         if new.traceparent:
-            print(
-                f"{_log_prefix} Updated traceparent: {new.traceparent[:20]}...",
-                flush=True,
-            )
+            print(f"{_log_prefix} Updated traceparent: {new.traceparent[:20]}...", flush=True)
         else:
             print(f"{_log_prefix} Traceparent cleared", flush=True)
 
@@ -336,11 +335,7 @@ async def handle_event(ws, event: dict) -> None:
             target_sessions.pop(session.get("target_id", ""), None)
         # Drop any in-flight Document requests scoped to this dying session
         # so network_requests can't grow unbounded across tab churn.
-        stale = [
-            rid
-            for rid, info in network_requests.items()
-            if info.get("session_id") == sid
-        ]
+        stale = [rid for rid, info in network_requests.items() if info.get("session_id") == sid]
         for rid in stale:
             network_requests.pop(rid, None)
         await rec.stop_recording(sid)
@@ -434,10 +429,7 @@ async def watch_config(config_path: str, interval: float = 1.0) -> None:
             if last_mtime is not None:
                 last_mtime = None
                 apply_config(Config())
-                print(
-                    f"{_log_prefix} Config file removed, reverted to defaults",
-                    flush=True,
-                )
+                print(f"{_log_prefix} Config file removed, reverted to defaults", flush=True)
         await asyncio.sleep(interval)
 
 
@@ -448,10 +440,7 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
         try:
             ws_url = get_browser_ws_url(host=host, port=port)
         except (OSError, Exception):
-            print(
-                f"{_log_prefix} CDP not reachable at {host}:{port} — retrying in {poll_interval}s",
-                flush=True,
-            )
+            print(f"{_log_prefix} CDP not reachable at {host}:{port} — retrying in {poll_interval}s", flush=True)
             await asyncio.sleep(poll_interval)
             continue
 
@@ -483,10 +472,7 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
 
                     await handle_event(ws, event)
         except (OSError, websockets.exceptions.WebSocketException) as exc:
-            print(
-                f"{_log_prefix} CDP connection lost ({exc}) — retrying in {poll_interval}s",
-                flush=True,
-            )
+            print(f"{_log_prefix} CDP connection lost ({exc}) — retrying in {poll_interval}s", flush=True)
             # Finalize any in-flight recordings
             await rec.stop_all()
             sessions.clear()
@@ -668,7 +654,9 @@ def strip_tinyproxy_timestamp(line: str) -> str:
 # (Chrome opens speculative TCP connections it never writes a request on, etc.).
 # These get demoted to `logfire.debug` so they don't show at LOG_LEVEL=INFO but
 # remain available at DEBUG for triage.
-_TINYPROXY_NOISE_PATTERNS: tuple[str, ...] = ("read_request_line: Client",)
+_TINYPROXY_NOISE_PATTERNS: tuple[str, ...] = (
+    "read_request_line: Client",
+)
 
 
 def _is_tinyproxy_noise(body: str) -> bool:
@@ -706,17 +694,12 @@ def watch_config_thread(config_path: str, interval: float = 1.0) -> None:
             if last_mtime is not None:
                 last_mtime = None
                 apply_config(Config())
-                print(
-                    f"{_log_prefix} Config file removed, reverted to defaults",
-                    flush=True,
-                )
+                print(f"{_log_prefix} Config file removed, reverted to defaults", flush=True)
         time.sleep(interval)
 
 
 def run_tinyproxy(config_path: str) -> None:
-    print(
-        f"{_log_prefix} Starting tinyproxy log shipper, reading from stdin", flush=True
-    )
+    print(f"{_log_prefix} Starting tinyproxy log shipper, reading from stdin", flush=True)
     watcher = threading.Thread(
         target=watch_config_thread, args=(config_path,), daemon=True
     )
