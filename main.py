@@ -38,8 +38,6 @@ class Config:
     # stdout / Fly logs. Hot-reloadable via the config-file watcher.
     log_level: str = "INFO"
     # Recording
-    http_port: int = 8088
-    record: bool = False
     browser_id: str = ""
     recording_dir: str = ""  # defaults to /tmp/recordings
 
@@ -65,8 +63,6 @@ class Config:
             cdp_port=int(values.get("CDP_PORT", "9222")),
             traceparent=tp if tp else None,
             log_level=values.get("LOG_LEVEL", "INFO").upper(),
-            http_port=int(values.get("BROWSER_TRACE_PORT", "8088")),
-            record=values.get("RECORD", "0") == "1",
             browser_id=values.get("BROWSER_ID", ""),
             recording_dir=values.get("RECORDING_DIR", ""),
         )
@@ -100,6 +96,10 @@ _config = Config()
 # clear these come from the browser-trace shipper, not from chrome's CDP or
 # the underlying tinyproxy service.
 _log_prefix: str = "[browser-trace]"
+
+# Port for the recording playback HTTP API. Fixed by convention (flyfleet
+# proxies it over the 6PN IP); not configurable.
+_HTTP_PORT = 8088
 
 
 
@@ -317,16 +317,15 @@ async def handle_event(ws, event: dict) -> None:
             await send_cdp(ws, "Page.enable", session_id=sid)
             await send_cdp(ws, "Network.enable", session_id=sid)
             await send_cdp(ws, "Page.getFrameTree", session_id=sid)
-            if _config.record:
-                try:
-                    await rec.start_recording(
-                        sid, target_id, ws, send_cdp, _config.browser_id, url
-                    )
-                except Exception as e:
-                    print(
-                        f"{_log_prefix} failed to record tab {sid[:8]}: {e}",
-                        flush=True,
-                    )
+            try:
+                await rec.start_recording(
+                    sid, target_id, ws, send_cdp, _config.browser_id, url
+                )
+            except Exception as e:
+                print(
+                    f"{_log_prefix} failed to record tab {sid[:8]}: {e}",
+                    flush=True,
+                )
 
     elif method == "Target.detachedFromTarget":
         sid = params.get("sessionId", "")
@@ -482,8 +481,8 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
             await asyncio.sleep(poll_interval)
 
 
-# Recording playback API. Recording is always-on (gated by RECORD) and needs no
-# start/stop trigger, so this only serves read endpoints: listing recordings and
+# Recording playback API. Recording is always-on and needs no start/stop
+# trigger, so this only serves read endpoints: listing recordings and
 # streaming an MP4.
 async def _handle_list(request: web.Request) -> web.Response:
     return web.json_response(
@@ -516,7 +515,7 @@ async def _handle_get(request: web.Request) -> web.StreamResponse:
 # flyfleet proxying the recording API over the 6PN IP). "::" accepts both IPv6
 # and, via dual-stack, IPv4 (localhost) — matching how the cdp-proxy socat binds.
 async def run_http_server(host: str = "::") -> None:
-    port = _config.http_port
+    port = _HTTP_PORT
     app = web.Application()
     app.add_routes(
         [

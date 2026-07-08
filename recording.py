@@ -3,7 +3,7 @@
 Captures JPEG frames from a CDP session, encodes them to MP4 via ffmpeg,
 and stores them on the local filesystem.
 
-Recording is always-on, gated by the RECORD config flag. A screencast is
+Recording is always-on. A screencast is
 started automatically for every tab the instant it attaches (Target.attachedToTarget),
 so every tab records for its whole lifetime with no API trigger. Each recording is
 finalized when its tab closes or the CDP connection drops.
