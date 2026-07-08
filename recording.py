@@ -3,8 +3,10 @@
 Captures JPEG frames from a CDP session, encodes them to MP4 via ffmpeg,
 and stores them locally or in S3-compatible storage (Fly Tigris).
 
-Recording is triggered via the HTTP API (POST /record/start),
-which starts a screencast on every active CDP session simultaneously.
+Recording is always-on, gated by the RECORD config flag. A screencast is
+started automatically for every tab the instant it attaches (Target.attachedToTarget),
+so every tab records for its whole lifetime with no API trigger. Each recording is
+finalized when its tab closes or the CDP connection drops.
 """
 
 import asyncio
@@ -20,7 +22,6 @@ from pathlib import Path
 from typing import Any
 
 
-_RECORDING_TIMEOUT = 5 * 60  # seconds
 _SCREENCAST_FPS = 5
 _SCREENCAST_NTH_FRAME = 2
 _SCREENCAST_QUALITY = 75
@@ -50,7 +51,6 @@ class _ActiveRecording:
     meta: RecordingMeta
     frames_dir: Path
     frame_count: int
-    timeout_task: asyncio.Task[None]
     started_ts: float
     # Held so stop_recording can tell Chrome to stop the screencast for this
     # session (best-effort). ws may be stale/closed by stop time (reconnect).
@@ -99,8 +99,8 @@ async def start_recording(
 ) -> str:
     """Start a screencast recording for the given CDP session.
 
-    Returns the recording_id. No-ops (returns existing id) if already recording,
-    so a tab re-focused during one recording period resumes into the same file.
+    Returns the recording_id. No-ops (returns existing id) if this session is
+    already recording, so a re-attach doesn't start a second overlapping file.
     """
     if session_id in _active:
         return _active[session_id].meta.recording_id
@@ -126,7 +126,6 @@ async def start_recording(
         meta=meta,
         frames_dir=frames_dir,
         frame_count=0,
-        timeout_task=asyncio.create_task(_timeout_stop(session_id)),
         started_ts=started_ts,
         ws=ws,
         send_cdp_fn=send_cdp_fn,
@@ -160,7 +159,6 @@ async def start_recording(
         print(f"[recording] start_screencast failed for {session_id}: {e}", flush=True)
         _active.pop(session_id, None)
         shutil.rmtree(frames_dir, ignore_errors=True)
-        recording.timeout_task.cancel()
         raise
 
     print(f"[recording] started {recording_id} for session {session_id[:8]}", flush=True)
@@ -201,13 +199,11 @@ async def stop_recording(session_id: str) -> RecordingMeta | None:
     if recording is None:
         return None
 
-    recording.timeout_task.cancel()
-
     # Best-effort: stop the Chrome-side screencast for this session. Without this
     # the screencast keeps running after we stop recording, so a later
-    # startScreencast on the same session (e.g. a second /record/start cycle)
-    # gets a stale/duplicated stream and stalls. Harmless no-op if the ws is
-    # already closed (reconnect) or the target detached.
+    # startScreencast on the same session (e.g. after a reconnect) gets a
+    # stale/duplicated stream and stalls. Harmless no-op if the ws is already
+    # closed (reconnect) or the target detached.
     try:
         await recording.send_cdp_fn(
             recording.ws, "Page.stopScreencast", session_id=session_id
@@ -262,13 +258,6 @@ def list_recordings() -> list[RecordingMeta]:
 def get_recording_path(recording_id: str) -> Path | None:
     path = _recordings_dir / f"{recording_id}.mp4"
     return path if path.exists() else None
-
-
-async def _timeout_stop(session_id: str) -> None:
-    await asyncio.sleep(_RECORDING_TIMEOUT)
-    if session_id in _active:
-        print(f"[recording] timeout reached for session {session_id[:8]}", flush=True)
-        await stop_recording(session_id)
 
 
 async def _encode_and_store(recording: _ActiveRecording) -> str:

@@ -38,6 +38,8 @@ class Config:
     log_level: str = "INFO"
     # Recording
     http_port: int = 8088
+    record: bool = False
+    browser_id: str = ""
     recording_storage: str = "local"  # "local" | "s3"
     recording_dir: str = ""  # defaults to /tmp/recordings
     tigris_bucket: str = ""
@@ -68,6 +70,8 @@ class Config:
             traceparent=tp if tp else None,
             log_level=values.get("LOG_LEVEL", "INFO").upper(),
             http_port=int(values.get("BROWSER_TRACE_PORT", "8088")),
+            record=values.get("RECORD", "0") == "1",
+            browser_id=values.get("BROWSER_ID", ""),
             recording_storage=values.get("RECORDING_STORAGE", "local"),
             recording_dir=values.get("RECORDING_DIR", ""),
             tigris_bucket=values.get("TIGRIS_BUCKET", ""),
@@ -80,16 +84,8 @@ class Config:
 # Per-session state: maps sessionId -> {target_id, main_frame_id, pending}
 sessions: dict[str, dict] = {}
 
-# Reverse map: target_id -> session_id (for HTTP recording requests)
+# Reverse map: target_id -> session_id (for recording lookups)
 target_sessions: dict[str, str] = {}
-
-# Recording "armed" state. Set true by POST /record/start and false by
-# /record/stop. While armed, any tab that attaches (Target.attachedToTarget) is
-# auto-recorded, so tabs opened mid-session are captured without a second API
-# call. _recording_browser_id carries the browser_id from the arming call so
-# new-tab recordings are named consistently.
-_recording_armed: bool = False
-_recording_browser_id: str = ""
 
 # Maps CDP message ID -> (method, sessionId) for response correlation
 pending_commands: dict[int, tuple[str, str | None]] = {}
@@ -113,7 +109,6 @@ _config = Config()
 # clear these come from the browser-trace shipper, not from chrome's CDP or
 # the underlying tinyproxy service.
 _log_prefix: str = "[browser-trace]"
-
 
 
 def _emit_with_traceparent(log_func, msg: str, attrs: dict) -> None:
@@ -145,8 +140,7 @@ def emit_cdp_event(
     attrs = {k: v for k, v in attrs.items() if v is not None}
     log_func = (
         logfire.error
-        if error_text is not None
-        or (status_code is not None and status_code >= 400)
+        if error_text is not None or (status_code is not None and status_code >= 400)
         else logfire.info
     )
     msg = f"{_log_prefix} {event}"
@@ -199,7 +193,10 @@ def apply_config(new: Config) -> None:
 
     if new.traceparent != old.traceparent:
         if new.traceparent:
-            print(f"{_log_prefix} Updated traceparent: {new.traceparent[:20]}...", flush=True)
+            print(
+                f"{_log_prefix} Updated traceparent: {new.traceparent[:20]}...",
+                flush=True,
+            )
         else:
             print(f"{_log_prefix} Traceparent cleared", flush=True)
 
@@ -340,17 +337,20 @@ async def handle_event(ws, event: dict) -> None:
             await send_cdp(ws, "Page.enable", session_id=sid)
             await send_cdp(ws, "Network.enable", session_id=sid)
             await send_cdp(ws, "Page.getFrameTree", session_id=sid)
-            # If recording is armed, capture this tab too — covers tabs opened
-            # after /record/start (DoD-2). start_recording no-ops if this
-            # session is somehow already recording.
-            if _recording_armed:
+            # Always-on recording: when RECORD is enabled, capture every tab from
+            # the moment it attaches. This handler fires both for tabs already
+            # open when we connect (via Target.setAutoAttach) and for tabs opened
+            # later, so a single path records every tab for its whole lifetime
+            # with no API trigger. start_recording no-ops if this session is
+            # somehow already recording.
+            if _config.record:
                 try:
                     await rec.start_recording(
-                        sid, target_id, ws, send_cdp, _recording_browser_id, url
+                        sid, target_id, ws, send_cdp, _config.browser_id, url
                     )
                 except Exception as e:
                     print(
-                        f"{_log_prefix} failed to auto-record new tab {sid[:8]}: {e}",
+                        f"{_log_prefix} failed to record tab {sid[:8]}: {e}",
                         flush=True,
                     )
 
@@ -361,7 +361,11 @@ async def handle_event(ws, event: dict) -> None:
             target_sessions.pop(session.get("target_id", ""), None)
         # Drop any in-flight Document requests scoped to this dying session
         # so network_requests can't grow unbounded across tab churn.
-        stale = [rid for rid, info in network_requests.items() if info.get("session_id") == sid]
+        stale = [
+            rid
+            for rid, info in network_requests.items()
+            if info.get("session_id") == sid
+        ]
         for rid in stale:
             network_requests.pop(rid, None)
         await rec.stop_recording(sid)
@@ -455,7 +459,10 @@ async def watch_config(config_path: str, interval: float = 1.0) -> None:
             if last_mtime is not None:
                 last_mtime = None
                 apply_config(Config())
-                print(f"{_log_prefix} Config file removed, reverted to defaults", flush=True)
+                print(
+                    f"{_log_prefix} Config file removed, reverted to defaults",
+                    flush=True,
+                )
         await asyncio.sleep(interval)
 
 
@@ -466,15 +473,16 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
         try:
             ws_url = get_browser_ws_url(host=host, port=port)
         except (OSError, Exception):
-            print(f"{_log_prefix} CDP not reachable at {host}:{port} — retrying in {poll_interval}s", flush=True)
+            print(
+                f"{_log_prefix} CDP not reachable at {host}:{port} — retrying in {poll_interval}s",
+                flush=True,
+            )
             await asyncio.sleep(poll_interval)
             continue
 
         print(f"{_log_prefix} Connecting to {ws_url}", flush=True)
         try:
             async with websockets.connect(ws_url, max_size=50 * 1024 * 1024) as ws:
-                global _current_ws
-                _current_ws = ws
                 print(f"{_log_prefix} Connected to CDP", flush=True)
 
                 await send_cdp(ws, "Target.setDiscoverTargets", {"discover": True})
@@ -500,12 +508,13 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
 
                     await handle_event(ws, event)
         except (OSError, websockets.exceptions.WebSocketException) as exc:
-            print(f"{_log_prefix} CDP connection lost ({exc}) — retrying in {poll_interval}s", flush=True)
-            _current_ws = None
+            print(
+                f"{_log_prefix} CDP connection lost ({exc}) — retrying in {poll_interval}s",
+                flush=True,
+            )
             # Finalize any in-flight recordings (encode from frames already on
-            # disk) before dropping session state, so they aren't orphaned until
-            # the 5-min timeout fires (DoD-5). Recording stays armed, so tabs
-            # re-recorded on reconnect resume capture.
+            # disk) before dropping session state, so they aren't orphaned. With
+            # RECORD enabled, tabs are re-recorded on reconnect via attachedToTarget.
             await rec.stop_all()
             sessions.clear()
             target_sessions.clear()
@@ -525,9 +534,14 @@ async def _send_json(writer: asyncio.StreamWriter, status: str, body: bytes) -> 
     await writer.drain()
 
 
-async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    """Minimal HTTP/1.1 handler for recording control and playback endpoints."""
-    global _recording_armed, _recording_browser_id
+async def handle_http(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    """Minimal HTTP/1.1 handler for recording playback endpoints.
+
+    Recording is always-on (gated by RECORD) and needs no start/stop trigger, so
+    this only serves read endpoints: listing recordings and streaming an MP4.
+    """
     try:
         raw = await reader.read(4096)
         if not raw:
@@ -538,64 +552,23 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             return
         method, path = parts[0], parts[1]
 
-        # POST /record/start  — start recording all active sessions
-        if method == "POST" and path == "/record/start":
-            if _current_ws is None:
-                await _send_json(writer, "503 Service Unavailable", b'{"error":"CDP not connected"}')
-                return
-            if not sessions:
-                await _send_json(writer, "404 Not Found", b'{"error":"no active sessions"}')
-                return
-            body_start = raw.find(b"\r\n\r\n")
-            browser_id = ""
-            if body_start != -1:
-                try:
-                    browser_id = json.loads(raw[body_start + 4:]).get("browser_id", "")
-                except Exception:
-                    pass
-            # Arm recording so tabs opened later are auto-captured (DoD-2).
-            _recording_armed = True
-            _recording_browser_id = browser_id
-            recording_ids = {}
-            for sid, session in sessions.items():
-                try:
-                    recording_id = await rec.start_recording(
-                        sid, session["target_id"], _current_ws, send_cdp,
-                        browser_id, session.get("url", ""),
-                    )
-                    recording_ids[session["target_id"]] = recording_id
-                except Exception as e:
-                    print(f"{_log_prefix} failed to start recording for session {sid[:8]}: {e}", flush=True)
-            await _send_json(writer, "200 OK", json.dumps({"recording_ids": recording_ids}).encode())
-
-        # POST /record/stop  — stop all active session recordings
-        elif method == "POST" and path == "/record/stop":
-            # Disarm first so a tab attaching mid-stop isn't auto-recorded.
-            _recording_armed = False
-            _recording_browser_id = ""
-            results = []
-            for sid in list(sessions.keys()):
-                meta = await rec.stop_recording(sid)
-                if meta and meta.storage_key:
-                    results.append({
-                        "recording_id": meta.recording_id,
-                        "storage_key": meta.storage_key,
-                        "duration_seconds": meta.duration_seconds,
-                    })
-            await _send_json(writer, "200 OK", json.dumps({"recordings": results}).encode())
-
         # GET /recordings
-        elif method == "GET" and path == "/recordings":
+        if method == "GET" and path == "/recordings":
             metas = rec.list_recordings()
-            body = json.dumps([{
-                "recording_id": m.recording_id,
-                "started_at": m.started_at,
-                "duration_seconds": m.duration_seconds,
-                "storage_key": m.storage_key,
-                "target_id": m.target_id,
-                "browser_id": m.browser_id,
-                "url": m.url,
-            } for m in metas]).encode()
+            body = json.dumps(
+                [
+                    {
+                        "recording_id": m.recording_id,
+                        "started_at": m.started_at,
+                        "duration_seconds": m.duration_seconds,
+                        "storage_key": m.storage_key,
+                        "target_id": m.target_id,
+                        "browser_id": m.browser_id,
+                        "url": m.url,
+                    }
+                    for m in metas
+                ]
+            ).encode()
             await _send_json(writer, "200 OK", body)
 
         # GET /recordings/<id>
@@ -609,8 +582,7 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                     f"HTTP/1.1 200 OK\r\n"
                     f"Content-Type: video/mp4\r\n"
                     f"Content-Length: {mp4_path.stat().st_size}\r\n"
-                    "Connection: close\r\n\r\n"
-                    .encode()
+                    "Connection: close\r\n\r\n".encode()
                 )
                 await writer.drain()
                 with open(mp4_path, "rb") as f:
@@ -623,11 +595,6 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 
     finally:
         writer.close()
-
-
-# Holds the active CDP websocket so the HTTP handler can call send_cdp on it.
-# Set when connected, cleared on disconnect.
-_current_ws = None
 
 
 # Bind IPv6 (dual-stack) rather than "0.0.0.0". Fly's private 6PN network is
@@ -760,9 +727,7 @@ def strip_tinyproxy_timestamp(line: str) -> str:
 # (Chrome opens speculative TCP connections it never writes a request on, etc.).
 # These get demoted to `logfire.debug` so they don't show at LOG_LEVEL=INFO but
 # remain available at DEBUG for triage.
-_TINYPROXY_NOISE_PATTERNS: tuple[str, ...] = (
-    "read_request_line: Client",
-)
+_TINYPROXY_NOISE_PATTERNS: tuple[str, ...] = ("read_request_line: Client",)
 
 
 def _is_tinyproxy_noise(body: str) -> bool:
@@ -800,12 +765,17 @@ def watch_config_thread(config_path: str, interval: float = 1.0) -> None:
             if last_mtime is not None:
                 last_mtime = None
                 apply_config(Config())
-                print(f"{_log_prefix} Config file removed, reverted to defaults", flush=True)
+                print(
+                    f"{_log_prefix} Config file removed, reverted to defaults",
+                    flush=True,
+                )
         time.sleep(interval)
 
 
 def run_tinyproxy(config_path: str) -> None:
-    print(f"{_log_prefix} Starting tinyproxy log shipper, reading from stdin", flush=True)
+    print(
+        f"{_log_prefix} Starting tinyproxy log shipper, reading from stdin", flush=True
+    )
     watcher = threading.Thread(
         target=watch_config_thread, args=(config_path,), daemon=True
     )
@@ -862,7 +832,9 @@ def main() -> None:
         "recordings",
         help="List saved recordings",
     )
-    p_rec.add_argument("config", nargs="?", default=".env", help="Path to the config file")
+    p_rec.add_argument(
+        "config", nargs="?", default=".env", help="Path to the config file"
+    )
 
     args = parser.parse_args()
 
@@ -896,11 +868,17 @@ def main() -> None:
             print("No recordings found.")
         else:
             for m in metas:
-                duration = f"{m.duration_seconds:.1f}s" if m.duration_seconds is not None else "in progress"
+                duration = (
+                    f"{m.duration_seconds:.1f}s"
+                    if m.duration_seconds is not None
+                    else "in progress"
+                )
                 browser = f"  browser={m.browser_id}" if m.browser_id else ""
                 tab = f"  tab={m.target_id[:8]}" if m.target_id else ""
                 url = f"  {m.url}" if m.url else ""
-                print(f"{m.recording_id}  {m.started_at}  {duration}  {m.storage_key}{browser}{tab}{url}")
+                print(
+                    f"{m.recording_id}  {m.started_at}  {duration}  {m.storage_key}{browser}{tab}{url}"
+                )
 
 
 if __name__ == "__main__":

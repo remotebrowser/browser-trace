@@ -32,21 +32,22 @@ CDP_HOST=127.0.0.1
 CDP_PORT=9222
 ```
 
-| Key                  | Description                                      | Required |
-|----------------------|--------------------------------------------------|----------|
-| `SERVICE_NAME`       | Service name reported to Logfire (default: `browser-trace`) | No |
-| `LOGFIRE_TOKEN`      | Logfire write token for sending telemetry        | No       |
-| `LOGFIRE_TRACEPARENT`| W3C traceparent to attach events to a parent trace | No     |
-| `LOG_LEVEL`          | Minimum severity gate for both the Fly-logs tee **and** Logfire emission (passed through to `logfire.configure(min_level=...)`). Default `INFO` drops tinyproxy `CONNECT` / `INFO` (mapped to `logfire.debug`) from both sinks; set `DEBUG` to surface them. Accepted: `DEBUG`, `INFO`, `NOTICE`, `WARN`, `ERROR`, `FATAL`. | No |
-| `CDP_HOST`           | Chrome DevTools Protocol host (default: `127.0.0.1`) | No   |
-| `CDP_PORT`           | Chrome DevTools Protocol port (default: `9222`)  | No       |
-| `RECORD`             | Set to `1` to enable screen recording for all tabs | No     |
-| `RECORDING_STORAGE`  | `local` (default) or `s3` (Fly Tigris)          | No       |
-| `RECORDING_DIR`      | Directory for local recordings (default: `/tmp/recordings`) | No |
-| `TIGRIS_BUCKET`      | Tigris bucket name (s3 mode only)                | No       |
-| `AWS_ACCESS_KEY_ID`  | Tigris key id (s3 mode only)                     | No       |
-| `AWS_SECRET_ACCESS_KEY` | Tigris secret (s3 mode only)                  | No       |
-| `AWS_ENDPOINT_URL`   | Tigris endpoint, e.g. `https://fly.storage.tigris.dev` (s3 mode only) | No |
+| Key                     | Description                                                                                                                                                                                                                                                                                                                 | Required |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| `SERVICE_NAME`          | Service name reported to Logfire (default: `browser-trace`)                                                                                                                                                                                                                                                                 | No       |
+| `LOGFIRE_TOKEN`         | Logfire write token for sending telemetry                                                                                                                                                                                                                                                                                   | No       |
+| `LOGFIRE_TRACEPARENT`   | W3C traceparent to attach events to a parent trace                                                                                                                                                                                                                                                                          | No       |
+| `LOG_LEVEL`             | Minimum severity gate for both the Fly-logs tee **and** Logfire emission (passed through to `logfire.configure(min_level=...)`). Default `INFO` drops tinyproxy `CONNECT` / `INFO` (mapped to `logfire.debug`) from both sinks; set `DEBUG` to surface them. Accepted: `DEBUG`, `INFO`, `NOTICE`, `WARN`, `ERROR`, `FATAL`. | No       |
+| `CDP_HOST`              | Chrome DevTools Protocol host (default: `127.0.0.1`)                                                                                                                                                                                                                                                                        | No       |
+| `CDP_PORT`              | Chrome DevTools Protocol port (default: `9222`)                                                                                                                                                                                                                                                                             | No       |
+| `RECORD`                | Set to `1` to record every tab (always-on; started automatically per tab). Default off.                                                                                                                                                                                                                                     | No       |
+| `BROWSER_ID`            | Browser id tagged onto every recording                                                                                                                                                                                                                                                                                      | No       |
+| `RECORDING_STORAGE`     | `local` (default) or `s3` (Fly Tigris)                                                                                                                                                                                                                                                                                      | No       |
+| `RECORDING_DIR`         | Directory for local recordings (default: `/tmp/recordings`)                                                                                                                                                                                                                                                                 | No       |
+| `TIGRIS_BUCKET`         | Tigris bucket name (s3 mode only)                                                                                                                                                                                                                                                                                           | No       |
+| `AWS_ACCESS_KEY_ID`     | Tigris key id (s3 mode only)                                                                                                                                                                                                                                                                                                | No       |
+| `AWS_SECRET_ACCESS_KEY` | Tigris secret (s3 mode only)                                                                                                                                                                                                                                                                                                | No       |
+| `AWS_ENDPOINT_URL`      | Tigris endpoint, e.g. `https://fly.storage.tigris.dev` (s3 mode only)                                                                                                                                                                                                                                                       | No       |
 
 The config file is watched for changes every 2 seconds, so `LOGFIRE_TRACEPARENT` can be updated at runtime without restarting the service.
 
