@@ -19,6 +19,7 @@ from urllib.request import urlopen
 
 import logfire
 import websockets
+from aiohttp import web
 
 import recording as rec
 
@@ -515,78 +516,33 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
             await asyncio.sleep(poll_interval)
 
 
-async def _send_json(writer: asyncio.StreamWriter, status: str, body: bytes) -> None:
-    response = (
-        f"HTTP/1.1 {status}\r\n"
-        "Content-Type: application/json\r\n"
-        f"Content-Length: {len(body)}\r\n"
-        "Connection: close\r\n\r\n"
+# Recording playback API. Recording is always-on (gated by RECORD) and needs no
+# start/stop trigger, so this only serves read endpoints: listing recordings and
+# streaming an MP4.
+async def _handle_list(request: web.Request) -> web.Response:
+    return web.json_response(
+        [
+            {
+                "recording_id": m.recording_id,
+                "started_at": m.started_at,
+                "duration_seconds": m.duration_seconds,
+                "storage_key": m.storage_key,
+                "target_id": m.target_id,
+                "browser_id": m.browser_id,
+                "url": m.url,
+            }
+            for m in rec.list_recordings()
+        ]
     )
-    writer.write(response.encode() + body)
-    await writer.drain()
 
 
-async def handle_http(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-) -> None:
-    """Minimal HTTP/1.1 handler for recording playback endpoints.
-
-    Recording is always-on (gated by RECORD) and needs no start/stop trigger, so
-    this only serves read endpoints: listing recordings and streaming an MP4.
-    """
-    try:
-        raw = await reader.read(4096)
-        if not raw:
-            return
-        request_line = raw.split(b"\r\n", 1)[0].decode()
-        parts = request_line.split()
-        if len(parts) < 2:
-            return
-        method, path = parts[0], parts[1]
-
-        # GET /recordings
-        if method == "GET" and path == "/recordings":
-            metas = rec.list_recordings()
-            body = json.dumps(
-                [
-                    {
-                        "recording_id": m.recording_id,
-                        "started_at": m.started_at,
-                        "duration_seconds": m.duration_seconds,
-                        "storage_key": m.storage_key,
-                        "target_id": m.target_id,
-                        "browser_id": m.browser_id,
-                        "url": m.url,
-                    }
-                    for m in metas
-                ]
-            ).encode()
-            await _send_json(writer, "200 OK", body)
-
-        # GET /recordings/<id>
-        elif method == "GET" and path.startswith("/recordings/"):
-            recording_id = path.strip("/").split("/", 1)[1]
-            mp4_path = rec.get_recording_path(recording_id)
-            if mp4_path is None:
-                await _send_json(writer, "404 Not Found", b'{"error":"not found"}')
-            else:
-                writer.write(
-                    f"HTTP/1.1 200 OK\r\n"
-                    f"Content-Type: video/mp4\r\n"
-                    f"Content-Length: {mp4_path.stat().st_size}\r\n"
-                    "Connection: close\r\n\r\n".encode()
-                )
-                await writer.drain()
-                with open(mp4_path, "rb") as f:
-                    while chunk := f.read(65536):
-                        writer.write(chunk)
-                        await writer.drain()
-
-        else:
-            await _send_json(writer, "404 Not Found", b'{"error":"not found"}')
-
-    finally:
-        writer.close()
+async def _handle_get(request: web.Request) -> web.StreamResponse:
+    # web.FileResponse handles HTTP Range requests, so a browser <video> player
+    # can seek/scrub the MP4 without downloading the whole file.
+    mp4_path = rec.get_recording_path(request.match_info["recording_id"])
+    if mp4_path is None:
+        return web.json_response({"error": "not found"}, status=404)
+    return web.FileResponse(mp4_path, headers={"Content-Type": "video/mp4"})
 
 
 # Bind IPv6 (dual-stack) rather than "0.0.0.0". Fly's private 6PN network is
@@ -595,10 +551,23 @@ async def handle_http(
 # and, via dual-stack, IPv4 (localhost) — matching how the cdp-proxy socat binds.
 async def run_http_server(host: str = "::") -> None:
     port = _config.http_port
-    server = await asyncio.start_server(handle_http, host, port)
+    app = web.Application()
+    app.add_routes(
+        [
+            web.get("/recordings", _handle_list),
+            web.get("/recordings/{recording_id}", _handle_get),
+        ]
+    )
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
     print(f"{_log_prefix} HTTP server listening on [{host}]:{port}", flush=True)
-    async with server:
-        await server.serve_forever()
+    try:
+        # Serve until run() cancels this task on shutdown.
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
 
 
 async def run(config_path: str) -> None:
