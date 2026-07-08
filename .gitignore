@@ -1,5 +1,4 @@
 .env*
-recordings/
 
 # Python-generated files
 __pycache__/
