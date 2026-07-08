@@ -337,12 +337,6 @@ async def handle_event(ws, event: dict) -> None:
             await send_cdp(ws, "Page.enable", session_id=sid)
             await send_cdp(ws, "Network.enable", session_id=sid)
             await send_cdp(ws, "Page.getFrameTree", session_id=sid)
-            # Always-on recording: when RECORD is enabled, capture every tab from
-            # the moment it attaches. This handler fires both for tabs already
-            # open when we connect (via Target.setAutoAttach) and for tabs opened
-            # later, so a single path records every tab for its whole lifetime
-            # with no API trigger. start_recording no-ops if this session is
-            # somehow already recording.
             if _config.record:
                 try:
                     await rec.start_recording(
@@ -512,9 +506,7 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
                 f"{_log_prefix} CDP connection lost ({exc}) — retrying in {poll_interval}s",
                 flush=True,
             )
-            # Finalize any in-flight recordings (encode from frames already on
-            # disk) before dropping session state, so they aren't orphaned. With
-            # RECORD enabled, tabs are re-recorded on reconnect via attachedToTarget.
+            # Finalize any in-flight recordings
             await rec.stop_all()
             sessions.clear()
             target_sessions.clear()
