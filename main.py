@@ -472,7 +472,6 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
                     await handle_event(ws, event)
         except (OSError, websockets.exceptions.WebSocketException) as exc:
             print(f"{_log_prefix} CDP connection lost ({exc}) — retrying in {poll_interval}s", flush=True)
-            # Finalize any in-flight recordings
             await rec.stop_all()
             sessions.clear()
             target_sessions.clear()
