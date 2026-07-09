@@ -27,6 +27,10 @@ _SCREENCAST_QUALITY = 75
 _SCREENCAST_MAX_WIDTH = 854
 _SCREENCAST_MAX_HEIGHT = 480
 
+# Hard cap on a recording's duration: force-finalize if a tab never detaches
+# (e.g. Chrome stuck never-idle) so frames can't grow on disk without bound.
+_MAX_RECORDING_SECONDS = 10 * 60
+
 
 @dataclass
 class RecordingMeta:
@@ -42,6 +46,7 @@ class RecordingMeta:
     target_id: str = ""
     url: str = ""
     browser_id: str = ""
+    timed_out: bool = False  # True if force-stopped by the max-duration guard
 
 
 @dataclass
@@ -54,6 +59,8 @@ class _ActiveRecording:
     # session (best-effort). ws may be stale/closed by stop time (reconnect).
     ws: object
     send_cdp_fn: object
+    # Max-duration watchdog; cancelled by a normal stop.
+    timeout_task: object = None
 
 
 # Per-tab recording state, keyed by CDP session_id. Not an opt-in registry:
@@ -143,8 +150,33 @@ async def start_recording(
         shutil.rmtree(frames_dir, ignore_errors=True)
         raise
 
+    # Arm the watchdog only after a successful start (the except above pops on
+    # failure), so a recording that never began leaves no orphan timer.
+    recording.timeout_task = asyncio.create_task(
+        _recording_watchdog(session_id, recording)
+    )
+
     print(f"[recording] started {recording_id} for session {session_id[:8]}", flush=True)
     return recording_id
+
+
+async def _recording_watchdog(session_id: str, recording: _ActiveRecording) -> None:
+    """Force-stop a recording that outlives _MAX_RECORDING_SECONDS.
+
+    A normal stop cancels this task while it's parked in the sleep below.
+    """
+    await asyncio.sleep(_MAX_RECORDING_SECONDS)
+    # Only act if this exact recording is still active (guards a reused
+    # session_id or a cancellation delivered a beat late).
+    if _active_recording_by_session.get(session_id) is not recording:
+        return
+    print(
+        f"[recording] {recording.meta.recording_id} hit max duration "
+        f"({_MAX_RECORDING_SECONDS}s), force-stopping",
+        flush=True,
+    )
+    recording.meta.timed_out = True
+    await stop_recording(session_id)
 
 
 def handle_screencast_frame(event_params: dict, session_id: str, ws, send_cdp_fn) -> None:
@@ -181,6 +213,13 @@ async def stop_recording(session_id: str) -> RecordingMeta | None:
     if recording is None:
         return None
 
+    # Cancel the watchdog, unless it's the caller (must not cancel its own
+    # task). Before the first await: tears down a sleeping watchdog before it
+    # can wake and mutate meta while we're mid-encode.
+    task = recording.timeout_task
+    if task is not None and task is not asyncio.current_task():
+        task.cancel()
+
     # Best-effort: stop the Chrome-side screencast for this session. Without this
     # the screencast keeps running after we stop recording, so a later
     # startScreencast on the same session (e.g. after a reconnect) gets a
@@ -201,6 +240,9 @@ async def stop_recording(session_id: str) -> RecordingMeta | None:
     if actual_frames == 0:
         print(f"[recording] {recording.meta.recording_id} has no frames, discarding", flush=True)
         shutil.rmtree(recording.frames_dir, ignore_errors=True)
+        # No MP4, but a timed-out tab still gets a sidecar so it surfaces.
+        if recording.meta.timed_out:
+            await _write_meta(recording.meta)
         return recording.meta
 
     try:

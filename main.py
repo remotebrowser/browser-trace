@@ -494,6 +494,7 @@ async def _handle_list(request: web.Request) -> web.Response:
                 "target_id": m.target_id,
                 "browser_id": m.browser_id,
                 "url": m.url,
+                "timed_out": m.timed_out,
             }
             for m in rec.list_recordings()
         ]
@@ -798,8 +799,9 @@ def main() -> None:
                 browser = f"  browser={m.browser_id}" if m.browser_id else ""
                 tab = f"  tab={m.target_id[:8]}" if m.target_id else ""
                 url = f"  {m.url}" if m.url else ""
+                timed_out = "  [timed-out]" if m.timed_out else ""
                 print(
-                    f"{m.recording_id}  {m.started_at}  {duration}  {m.storage_key}{browser}{tab}{url}"
+                    f"{m.recording_id}  {m.started_at}  {duration}  {m.storage_key}{browser}{tab}{url}{timed_out}"
                 )
 
 
