@@ -56,8 +56,11 @@ class _ActiveRecording:
     send_cdp_fn: object
 
 
-# session_id -> active recording
-_active: dict[str, _ActiveRecording] = {}
+# Per-tab recording state, keyed by CDP session_id. Not an opt-in registry:
+# recording is always-on, so this holds one entry per open tab. It exists to
+# correlate the async event stream back to each tab — screencastFrame events
+# carry only a session_id and must find their tab's frames_dir + frame counter.
+_active_recording_by_session: dict[str, _ActiveRecording] = {}
 
 # Injected at startup from Config
 _recordings_dir: Path = Path("recordings")
@@ -82,8 +85,8 @@ async def start_recording(
     Returns the recording_id. No-ops (returns existing id) if this session is
     already recording, so a re-attach doesn't start a second overlapping file.
     """
-    if session_id in _active:
-        return _active[session_id].meta.recording_id
+    if session_id in _active_recording_by_session:
+        return _active_recording_by_session[session_id].meta.recording_id
 
     recording_id = _new_id(browser_id, target_id)
     frames_dir = Path(tempfile.mkdtemp(prefix=f"bt-rec-{recording_id}-"))
@@ -109,7 +112,7 @@ async def start_recording(
         ws=ws,
         send_cdp_fn=send_cdp_fn,
     )
-    _active[session_id] = recording
+    _active_recording_by_session[session_id] = recording
 
     try:
         # Make this tab render as if focused, even while backgrounded. Chrome
@@ -136,7 +139,7 @@ async def start_recording(
         )
     except Exception as e:
         print(f"[recording] start_screencast failed for {session_id}: {e}", flush=True)
-        _active.pop(session_id, None)
+        _active_recording_by_session.pop(session_id, None)
         shutil.rmtree(frames_dir, ignore_errors=True)
         raise
 
@@ -146,7 +149,7 @@ async def start_recording(
 
 def handle_screencast_frame(event_params: dict, session_id: str, ws, send_cdp_fn) -> None:
     """Call this from the CDP event loop when Page.screencastFrame arrives."""
-    recording = _active.get(session_id)
+    recording = _active_recording_by_session.get(session_id)
     if recording is None:
         return
 
@@ -174,7 +177,7 @@ def handle_screencast_frame(event_params: dict, session_id: str, ws, send_cdp_fn
 
 async def stop_recording(session_id: str) -> RecordingMeta | None:
     """Stop the recording for session_id, encode to MP4, and persist."""
-    recording = _active.pop(session_id, None)
+    recording = _active_recording_by_session.pop(session_id, None)
     if recording is None:
         return None
 
@@ -218,7 +221,7 @@ async def stop_recording(session_id: str) -> RecordingMeta | None:
 
 
 async def stop_all() -> None:
-    for session_id in list(_active.keys()):
+    for session_id in list(_active_recording_by_session.keys()):
         await stop_recording(session_id)
 
 
