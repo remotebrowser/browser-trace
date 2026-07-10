@@ -279,11 +279,6 @@ def list_recordings() -> list[RecordingMeta]:
     return sorted(metas, key=lambda m: m.started_at, reverse=True)
 
 
-def get_recording_path(recording_id: str) -> Path | None:
-    path = _recordings_dir / f"{recording_id}.mp4"
-    return path if path.exists() else None
-
-
 async def _encode_and_store(recording: _ActiveRecording) -> str:
     recording_id = recording.meta.recording_id
     mp4_path = recording.frames_dir / f"{recording_id}.mp4"

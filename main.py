@@ -19,7 +19,6 @@ from urllib.request import urlopen
 
 import logfire
 import websockets
-from aiohttp import web
 
 import recording as rec
 
@@ -96,10 +95,6 @@ _config = Config()
 # clear these come from the browser-trace shipper, not from chrome's CDP or
 # the underlying tinyproxy service.
 _log_prefix: str = "[browser-trace]"
-
-# Port for the recording playback HTTP API. Fixed by convention (flyfleet
-# proxies it over the 6PN IP); not configurable.
-_HTTP_PORT = 8088
 
 
 
@@ -480,61 +475,6 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
             await asyncio.sleep(poll_interval)
 
 
-# Recording playback API. Recording is always-on and needs no start/stop
-# trigger, so this only serves read endpoints: listing recordings and
-# streaming an MP4.
-async def _handle_list(request: web.Request) -> web.Response:
-    return web.json_response(
-        [
-            {
-                "recording_id": m.recording_id,
-                "started_at": m.started_at,
-                "duration_seconds": m.duration_seconds,
-                "storage_key": m.storage_key,
-                "target_id": m.target_id,
-                "browser_id": m.browser_id,
-                "url": m.url,
-                "timed_out": m.timed_out,
-            }
-            for m in rec.list_recordings()
-        ]
-    )
-
-
-async def _handle_get(request: web.Request) -> web.StreamResponse:
-    # web.FileResponse handles HTTP Range requests, so a browser <video> player
-    # can seek/scrub the MP4 without downloading the whole file.
-    mp4_path = rec.get_recording_path(request.match_info["recording_id"])
-    if mp4_path is None:
-        return web.json_response({"error": "not found"}, status=404)
-    return web.FileResponse(mp4_path, headers={"Content-Type": "video/mp4"})
-
-
-# Bind IPv6 (dual-stack) rather than "0.0.0.0". Fly's private 6PN network is
-# IPv6-only, so an IPv4-only bind is unreachable from other machines (e.g.
-# flyfleet proxying the recording API over the 6PN IP). "::" accepts both IPv6
-# and, via dual-stack, IPv4 (localhost) — matching how the cdp-proxy socat binds.
-async def run_http_server(host: str = "::") -> None:
-    port = _HTTP_PORT
-    app = web.Application()
-    app.add_routes(
-        [
-            web.get("/recordings", _handle_list),
-            web.get("/recordings/{recording_id}", _handle_get),
-        ]
-    )
-    runner = web.AppRunner(app, access_log=None)
-    await runner.setup()
-    site = web.TCPSite(runner, host, port)
-    await site.start()
-    print(f"{_log_prefix} HTTP server listening on [{host}]:{port}", flush=True)
-    try:
-        # Serve until run() cancels this task on shutdown.
-        await asyncio.Event().wait()
-    finally:
-        await runner.cleanup()
-
-
 async def run(config_path: str) -> None:
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -544,13 +484,12 @@ async def run(config_path: str) -> None:
 
     watcher = asyncio.create_task(watch_config(config_path))
     cdp_task = asyncio.create_task(connect_cdp())
-    http_task = asyncio.create_task(run_http_server())
     try:
         # Wait until a signal fires or cdp_task ends on its own
         stop_future = asyncio.ensure_future(stop_event.wait())
         await asyncio.wait([cdp_task, stop_future], return_when=asyncio.FIRST_COMPLETED)
     finally:
-        for task in (watcher, cdp_task, http_task):
+        for task in (watcher, cdp_task):
             task.cancel()
             try:
                 await task
