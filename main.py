@@ -33,6 +33,10 @@ class Config:
     # are still sent to Logfire (so the UI sees them) but are not tee'd to
     # stdout / Fly logs. Hot-reloadable via the config-file watcher.
     log_level: str = "INFO"
+    # CDP-mode: run the CAPTCHA vendor classifier on every main-frame
+    # navigation. Hot-reloadable, so it can be flipped off in prod without a
+    # redeploy if it ever proves too noisy/costly.
+    captcha_classify: bool = True
 
     @classmethod
     def from_file(cls, path: str) -> "Config":
@@ -56,6 +60,8 @@ class Config:
             cdp_port=int(values.get("CDP_PORT", "9222")),
             traceparent=tp if tp else None,
             log_level=values.get("LOG_LEVEL", "INFO").upper(),
+            captcha_classify=values.get("CAPTCHA_CLASSIFY", "true").strip().lower()
+            not in ("0", "false", "no", "off"),
         )
 
 
@@ -86,6 +92,22 @@ _config = Config()
 _log_prefix: str = "[browser-trace]"
 
 
+# CAPTCHA vendor classifier, run via Runtime.evaluate on every main-frame
+# navigation. Self-contained IIFE that sniffs the live DOM (script/iframe/link
+# srcs + outerHTML) and returns a vendor slug ("cloudflare", "recaptcha_v2", …)
+# or "unknown". Lives in captcha_classifier.js beside this module (a copy of
+# remotebrowser's getgather/captcha_classifier.js — keep in sync when vendors
+# are added there). Loaded once at import; bundled into the PyInstaller binary
+# via `datas` in browser-trace.spec and resolved from sys._MEIPASS when frozen.
+def _resource_dir() -> "os.PathLike[str] | str":
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+with open(os.path.join(_resource_dir(), "captcha_classifier.js")) as _f:
+    CAPTCHA_CLASSIFIER_JS = _f.read()
+
 
 def _emit_with_traceparent(log_func, msg: str, attrs: dict) -> None:
     if _config.traceparent:
@@ -103,6 +125,7 @@ def emit_cdp_event(
     status_code: int | None = None,
     error_text: str | None = None,
     is_main_frame: bool | None = None,
+    captcha_kind: str | None = None,
     event_timestamp: str | None = None,
 ) -> None:
     attrs = {
@@ -111,6 +134,7 @@ def emit_cdp_event(
         "status_code": status_code,
         "error_text": error_text,
         "is_main_frame": is_main_frame,
+        "captcha_kind": captcha_kind,
         "event_timestamp": event_timestamp,
     }
     attrs = {k: v for k, v in attrs.items() if v is not None}
@@ -197,6 +221,9 @@ async def send_cdp(
 
 
 def emit_navigation(session: dict, url: str, status_code: int) -> None:
+    # Remember the main-frame URL so an async CAPTCHA probe (fired later on
+    # Page.domContentEventFired) can attribute its result to this navigation.
+    session["last_url"] = url
     emit_cdp_event(
         "navigation",
         tab_id=session.get("target_id", ""),
@@ -206,6 +233,20 @@ def emit_navigation(session: dict, url: str, status_code: int) -> None:
     )
     print(
         f"{_log_prefix} navigation: tab={session.get('target_id', '')[:8]} status={status_code} url={url}",
+        flush=True,
+    )
+
+
+def emit_captcha_detected(session: dict, url: str, kind: str) -> None:
+    emit_cdp_event(
+        "captcha_detected",
+        tab_id=session.get("target_id", ""),
+        tab_url=url,
+        captcha_kind=kind,
+        event_timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+    print(
+        f"{_log_prefix} captcha_detected: tab={session.get('target_id', '')[:8]} kind={kind} url={url}",
         flush=True,
     )
 
@@ -256,6 +297,14 @@ async def handle_response(event: dict) -> None:
             sessions[session_id]["main_frame_id"] = frame_id
             flush_pending(sessions[session_id])
 
+    elif method == "Runtime.evaluate" and session_id and session_id in sessions:
+        # CAPTCHA classifier result. returnByValue shape:
+        # {"result": {"result": {"type": "string", "value": "cloudflare"}}}
+        value = result.get("result", {}).get("value")
+        if isinstance(value, str) and value and value != "unknown":
+            session = sessions[session_id]
+            emit_captcha_detected(session, session.get("captcha_probe_url", ""), value)
+
 
 async def handle_event(ws, event: dict) -> None:
     """Process a CDP event."""
@@ -304,6 +353,20 @@ async def handle_event(ws, event: dict) -> None:
         if "parentId" not in frame and session_id in sessions:
             sessions[session_id]["main_frame_id"] = frame.get("id")
             flush_pending(sessions[session_id])
+
+    elif method == "Page.domContentEventFired" and session_id and session_id in sessions:
+        # DOM is parsed — sniff for a CAPTCHA vendor. Fire-and-forget: the
+        # receive loop is sequential, so we cannot await the result here; it
+        # comes back as a Runtime.evaluate response handled in handle_response.
+        if _config.captcha_classify:
+            session = sessions[session_id]
+            session["captcha_probe_url"] = session.get("last_url", "")
+            await send_cdp(
+                ws,
+                "Runtime.evaluate",
+                {"expression": CAPTCHA_CLASSIFIER_JS, "returnByValue": True},
+                session_id=session_id,
+            )
 
     elif method == "Network.requestWillBeSent" and session_id:
         request_id = params.get("requestId", "")
