@@ -40,12 +40,10 @@ class RecordingMeta:
     stopped_at: str | None
     duration_seconds: float | None
     storage_key: str  # filename relative to the recordings dir, e.g. <id>.mp4
-    # Tab + browser identity for triage: an error elsewhere (e.g. remotebrowser)
-    # carries the same (browser_id, target_id) and can be joined to this
-    # recording. Defaulted so sidecar JSON written by older builds still loads.
+    # Tab identity for triage: an error elsewhere (e.g. remotebrowser) carries
+    # the same target_id and can be joined to this recording.
     target_id: str = ""
     url: str = ""
-    browser_id: str = ""
     timed_out: bool = False  # True if force-stopped by the max-duration guard
 
 
@@ -84,7 +82,6 @@ async def start_recording(
     target_id: str,
     ws,
     send_cdp_fn,
-    browser_id: str = "",
     url: str = "",
 ) -> str:
     """Start a screencast recording for the given CDP session.
@@ -95,7 +92,7 @@ async def start_recording(
     if session_id in _active_recording_by_session:
         return _active_recording_by_session[session_id].meta.recording_id
 
-    recording_id = _new_id(browser_id, target_id)
+    recording_id = _new_id(target_id)
     frames_dir = Path(tempfile.mkdtemp(prefix=f"bt-rec-{recording_id}-"))
     started_ts = asyncio.get_event_loop().time()
 
@@ -108,7 +105,6 @@ async def start_recording(
         storage_key="",
         target_id=target_id,
         url=url,
-        browser_id=browser_id,
     )
 
     recording = _ActiveRecording(
@@ -302,12 +298,12 @@ async def _write_meta(meta: RecordingMeta) -> None:
     (_recordings_dir / f"{meta.recording_id}.json").write_text(payload)
 
 
-def _new_id(browser_id: str = "", target_id: str = "") -> str:
+def _new_id(target_id: str = "") -> str:
     # Fold target_id in so concurrent tabs never share an id (which would make
     # their <id>.mp4 / <id>.json overwrite each other). A short random suffix
     # keeps ids unique even for the same tab recorded twice within one second.
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     alphabet = string.ascii_lowercase + string.digits
     suffix = "".join(secrets.choice(alphabet) for _ in range(6))
-    parts = [p for p in (browser_id, ts, target_id[:8].lower(), suffix) if p]
+    parts = [p for p in (ts, target_id[:8].lower(), suffix) if p]
     return "_".join(parts)

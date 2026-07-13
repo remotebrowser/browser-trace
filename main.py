@@ -37,7 +37,6 @@ class Config:
     # stdout / Fly logs. Hot-reloadable via the config-file watcher.
     log_level: str = "INFO"
     # Recording
-    browser_id: str = ""
     recording_dir: str = ""  # defaults to /tmp/recordings
 
     @classmethod
@@ -62,7 +61,6 @@ class Config:
             cdp_port=int(values.get("CDP_PORT", "9222")),
             traceparent=tp if tp else None,
             log_level=values.get("LOG_LEVEL", "INFO").upper(),
-            browser_id=values.get("BROWSER_ID", ""),
             recording_dir=values.get("RECORDING_DIR", ""),
         )
 
@@ -313,9 +311,7 @@ async def handle_event(ws, event: dict) -> None:
             await send_cdp(ws, "Network.enable", session_id=sid)
             await send_cdp(ws, "Page.getFrameTree", session_id=sid)
             try:
-                await rec.start_recording(
-                    sid, target_id, ws, send_cdp, _config.browser_id, url
-                )
+                await rec.start_recording(sid, target_id, ws, send_cdp, url)
             except Exception as e:
                 print(
                     f"{_log_prefix} failed to record tab {sid[:8]}: {e}",
