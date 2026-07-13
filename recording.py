@@ -267,18 +267,6 @@ async def stop_all() -> None:
         await stop_recording(session_id)
 
 
-def list_recordings() -> list[RecordingMeta]:
-    fields = {f for f in RecordingMeta.__dataclass_fields__}
-    metas = []
-    for p in _recordings_dir.glob("*.json"):
-        try:
-            data = {k: v for k, v in json.loads(p.read_text()).items() if k in fields}
-            metas.append(RecordingMeta(**data))
-        except Exception:
-            continue
-    return sorted(metas, key=lambda m: m.started_at, reverse=True)
-
-
 async def _encode_and_store(recording: _ActiveRecording) -> str:
     recording_id = recording.meta.recording_id
     mp4_path = recording.frames_dir / f"{recording_id}.mp4"

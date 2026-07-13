@@ -665,7 +665,7 @@ def main() -> None:
     # subcommand. If the first arg is not a known subcommand (and isn't a
     # flag), insert `cdp` so the existing chrome-live deployment keeps
     # working unchanged.
-    known_cmds = {"cdp", "tinyproxy", "recordings"}
+    known_cmds = {"cdp", "tinyproxy"}
     if (
         len(sys.argv) >= 2
         and sys.argv[1] not in known_cmds
@@ -689,14 +689,6 @@ def main() -> None:
         help="Read tinyproxy log lines from stdin and forward them to Logfire",
     )
     p_tp.add_argument("config", help="Path to the config file")
-
-    p_rec = subparsers.add_parser(
-        "recordings",
-        help="List saved recordings",
-    )
-    p_rec.add_argument(
-        "config", nargs="?", default=".env", help="Path to the config file"
-    )
 
     args = parser.parse_args()
 
@@ -724,24 +716,6 @@ def main() -> None:
             run_tinyproxy(args.config)
         except KeyboardInterrupt:
             pass
-    elif args.cmd == "recordings":
-        metas = rec.list_recordings()
-        if not metas:
-            print("No recordings found.")
-        else:
-            for m in metas:
-                duration = (
-                    f"{m.duration_seconds:.1f}s"
-                    if m.duration_seconds is not None
-                    else "in progress"
-                )
-                browser = f"  browser={m.browser_id}" if m.browser_id else ""
-                tab = f"  tab={m.target_id[:8]}" if m.target_id else ""
-                url = f"  {m.url}" if m.url else ""
-                timed_out = "  [timed-out]" if m.timed_out else ""
-                print(
-                    f"{m.recording_id}  {m.started_at}  {duration}  {m.storage_key}{browser}{tab}{url}{timed_out}"
-                )
 
 
 if __name__ == "__main__":

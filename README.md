@@ -69,15 +69,9 @@ tinyproxy -d -c /etc/tinyproxy.conf | uv run main.py tinyproxy .env
 
 Reads tinyproxy log lines from stdin (one per line), parses the leading log level (`CONNECT`, `ERROR`, `WARNING`, `NOTICE`, `CRITICAL`, `INFO`), tees each line to stdout for container log collectors, and emits to Logfire via the appropriate severity (`logfire.info` / `logfire.warn` / `logfire.error` / `logfire.notice`). Each event carries a `tinyproxy_level` attribute so the level is queryable in Logfire. Configure tinyproxy with `LogFile "/dev/stdout"` so its log writes flow to the pipe.
 
-### `recordings` — list saved recordings
+## Recordings
 
-```sh
-uv run main.py recordings .env
-```
-
-Prints all recordings in the configured `RECORDING_DIR`, newest first.
-
-Recordings land in `RECORDING_DIR` as `<id>.mp4` + `<id>.json` sidecar files.
+Recording is always-on in `cdp` mode: a screencast is captured for every tab and finalized when the tab closes. Recordings land in `RECORDING_DIR` as `<id>.mp4` + `<id>.json` sidecar files.
 
 ## Building a standalone binary
 
