@@ -14,10 +14,13 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.request import urlopen
 
 import logfire
 import websockets
+
+import recording as rec
 
 
 @dataclass
@@ -33,6 +36,8 @@ class Config:
     # are still sent to Logfire (so the UI sees them) but are not tee'd to
     # stdout / Fly logs. Hot-reloadable via the config-file watcher.
     log_level: str = "INFO"
+    # Recording
+    recording_dir: str = ""  # defaults to /tmp/recordings
 
     @classmethod
     def from_file(cls, path: str) -> "Config":
@@ -56,11 +61,15 @@ class Config:
             cdp_port=int(values.get("CDP_PORT", "9222")),
             traceparent=tp if tp else None,
             log_level=values.get("LOG_LEVEL", "INFO").upper(),
+            recording_dir=values.get("RECORDING_DIR", ""),
         )
 
 
 # Per-session state: maps sessionId -> {target_id, main_frame_id, pending}
 sessions: dict[str, dict] = {}
+
+# Reverse map: target_id -> session_id (for recording lookups)
+target_sessions: dict[str, str] = {}
 
 # Maps CDP message ID -> (method, sessionId) for response correlation
 pending_commands: dict[int, tuple[str, str | None]] = {}
@@ -174,6 +183,14 @@ def apply_config(new: Config) -> None:
         else:
             print(f"{_log_prefix} Traceparent cleared", flush=True)
 
+    recordings_dir = (
+        Path(new.recording_dir).resolve()
+        if new.recording_dir
+        else Path("/tmp/recordings")
+    )
+    rec.configure(recordings_dir=recordings_dir)
+    print(f"{_log_prefix} Recordings dir: {recordings_dir}", flush=True)
+
 
 def get_browser_ws_url(host: str = "127.0.0.1", port: int = 9222) -> str:
     """Fetch the browser websocket URL from CDP /json/version endpoint."""
@@ -281,23 +298,40 @@ async def handle_event(ws, event: dict) -> None:
         target_info = params.get("targetInfo", {})
         sid = params.get("sessionId", "")
         if target_info.get("type") == "page" and sid:
+            target_id = target_info.get("targetId", "")
+            url = target_info.get("url", "")
             sessions[sid] = {
-                "target_id": target_info.get("targetId", ""),
+                "target_id": target_id,
+                "url": url,
                 "main_frame_id": None,
                 "pending": [],
             }
+            target_sessions[target_id] = sid
             await send_cdp(ws, "Page.enable", session_id=sid)
             await send_cdp(ws, "Network.enable", session_id=sid)
             await send_cdp(ws, "Page.getFrameTree", session_id=sid)
+            try:
+                await rec.start_recording(sid, target_id, ws, send_cdp, url)
+            except Exception as e:
+                print(
+                    f"{_log_prefix} failed to record tab {sid[:8]}: {e}",
+                    flush=True,
+                )
 
     elif method == "Target.detachedFromTarget":
         sid = params.get("sessionId", "")
-        sessions.pop(sid, None)
+        session = sessions.pop(sid, None)
+        if session:
+            target_sessions.pop(session.get("target_id", ""), None)
         # Drop any in-flight Document requests scoped to this dying session
         # so network_requests can't grow unbounded across tab churn.
         stale = [rid for rid, info in network_requests.items() if info.get("session_id") == sid]
         for rid in stale:
             network_requests.pop(rid, None)
+        await rec.stop_recording(sid)
+
+    elif method == "Page.screencastFrame" and session_id:
+        rec.handle_screencast_frame(params, session_id, ws, send_cdp)
 
     elif method == "Page.frameNavigated" and session_id:
         frame = params.get("frame", {})
@@ -429,7 +463,9 @@ async def connect_cdp(poll_interval: float = 5.0) -> None:
                     await handle_event(ws, event)
         except (OSError, websockets.exceptions.WebSocketException) as exc:
             print(f"{_log_prefix} CDP connection lost ({exc}) — retrying in {poll_interval}s", flush=True)
+            await rec.stop_all()
             sessions.clear()
+            target_sessions.clear()
             pending_commands.clear()
             network_requests.clear()
             await asyncio.sleep(poll_interval)
@@ -455,6 +491,7 @@ async def run(config_path: str) -> None:
                 await task
             except asyncio.CancelledError:
                 pass
+        await rec.stop_all()
         print(f"{_log_prefix} Shutting down", flush=True)
 
 
