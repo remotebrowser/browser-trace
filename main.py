@@ -36,10 +36,6 @@ class Config:
     # are still sent to Logfire (so the UI sees them) but are not tee'd to
     # stdout / Fly logs. Hot-reloadable via the config-file watcher.
     log_level: str = "INFO"
-    # CDP-mode: run the CAPTCHA vendor classifier on every main-frame
-    # navigation. Hot-reloadable, so it can be flipped off in prod without a
-    # redeploy if it ever proves too noisy/costly.
-    captcha_classify: bool = True
     # Recording
     recording_dir: str = ""  # defaults to /tmp/recordings
 
@@ -65,8 +61,6 @@ class Config:
             cdp_port=int(values.get("CDP_PORT", "9222")),
             traceparent=tp if tp else None,
             log_level=values.get("LOG_LEVEL", "INFO").upper(),
-            captcha_classify=values.get("CAPTCHA_CLASSIFY", "true").strip().lower()
-            not in ("0", "false", "no", "off"),
             recording_dir=values.get("RECORDING_DIR", ""),
         )
 
@@ -448,8 +442,7 @@ async def handle_event(ws, event: dict) -> None:
         # comes back as a Runtime.evaluate response handled in handle_response.
         # Probe several times (see CAPTCHA_PROBE_DELAYS) because most vendors
         # inject their widget after DOMContentLoaded.
-        if _config.captcha_classify:
-            schedule_captcha_probe(ws, session_id, sessions[session_id].get("last_url", ""))
+        schedule_captcha_probe(ws, session_id, sessions[session_id].get("last_url", ""))
 
     elif method == "Network.requestWillBeSent" and session_id:
         request_id = params.get("requestId", "")
