@@ -117,6 +117,18 @@ def _resource_dir() -> "os.PathLike[str] | str":
 with open(os.path.join(_resource_dir(), "captcha_classifier.js")) as _f:
     CAPTCHA_CLASSIFIER_JS = _f.read()
 
+# When to re-run the CAPTCHA classifier, as seconds after DOMContentLoaded. The
+# major vendors (Cloudflare Turnstile, hCaptcha, reCAPTCHA, AWS WAF) inject
+# their scripts/iframes asynchronously *after* DOMContentLoaded, so a single
+# probe at that instant misses them and logs nothing. Re-probing a few times
+# catches late-rendered widgets; handle_response dedups so a captcha that
+# persists across probes is logged at most once per navigation.
+CAPTCHA_PROBE_DELAYS: tuple[float, ...] = (0.0, 1.0, 3.0, 6.0)
+
+# Live references to in-flight probe tasks, so create_task'd coroutines aren't
+# garbage-collected mid-flight (asyncio only holds a weak ref).
+_probe_tasks: set[asyncio.Task] = set()
+
 
 def _emit_with_traceparent(log_func, msg: str, attrs: dict) -> None:
     if _config.traceparent:
@@ -268,6 +280,42 @@ def emit_captcha_detected(session: dict, url: str, kind: str) -> None:
     )
 
 
+async def probe_captcha(ws, session_id: str, probe_url: str) -> None:
+    """Run the CAPTCHA classifier several times after DOMContentLoaded to catch
+    vendors whose widgets render asynchronously. Fire-and-forget: each probe's
+    result comes back as a Runtime.evaluate response handled in handle_response,
+    which dedups per navigation. Bails as soon as the tab closes or navigates
+    elsewhere so we don't probe a stale page."""
+    for delay in CAPTCHA_PROBE_DELAYS:
+        if delay:
+            await asyncio.sleep(delay)
+        session = sessions.get(session_id)
+        # Tab gone, or a newer navigation replaced this one — stop probing.
+        if session is None or session.get("captcha_probe_url") != probe_url:
+            return
+        try:
+            await send_cdp(
+                ws,
+                "Runtime.evaluate",
+                {"expression": CAPTCHA_CLASSIFIER_JS, "returnByValue": True},
+                session_id=session_id,
+            )
+        except (OSError, websockets.exceptions.WebSocketException):
+            return  # Connection dropped; the reconnect path will re-arm probes.
+
+
+def schedule_captcha_probe(ws, session_id: str, probe_url: str) -> None:
+    """Arm a fresh multi-shot CAPTCHA probe for a navigation, resetting the
+    per-navigation dedup set so this page's detections are reported independently
+    of the previous one."""
+    session = sessions[session_id]
+    session["captcha_probe_url"] = probe_url
+    session["captcha_reported"] = set()
+    task = asyncio.create_task(probe_captcha(ws, session_id, probe_url))
+    _probe_tasks.add(task)
+    task.add_done_callback(_probe_tasks.discard)
+
+
 def emit_navigation_failed(
     session: dict, url: str, error_text: str, is_main_frame: bool
 ) -> None:
@@ -320,7 +368,13 @@ async def handle_response(event: dict) -> None:
         value = result.get("result", {}).get("value")
         if isinstance(value, str) and value and value != "unknown":
             session = sessions[session_id]
-            emit_captcha_detected(session, session.get("captcha_probe_url", ""), value)
+            # Dedup within a navigation: the multi-shot probe re-runs the
+            # classifier several times, so a persistent captcha would otherwise
+            # be logged once per probe.
+            reported = session.setdefault("captcha_reported", set())
+            if value not in reported:
+                reported.add(value)
+                emit_captcha_detected(session, session.get("captcha_probe_url", ""), value)
 
 
 async def handle_event(ws, event: dict) -> None:
@@ -392,15 +446,10 @@ async def handle_event(ws, event: dict) -> None:
         # DOM is parsed — sniff for a CAPTCHA vendor. Fire-and-forget: the
         # receive loop is sequential, so we cannot await the result here; it
         # comes back as a Runtime.evaluate response handled in handle_response.
+        # Probe several times (see CAPTCHA_PROBE_DELAYS) because most vendors
+        # inject their widget after DOMContentLoaded.
         if _config.captcha_classify:
-            session = sessions[session_id]
-            session["captcha_probe_url"] = session.get("last_url", "")
-            await send_cdp(
-                ws,
-                "Runtime.evaluate",
-                {"expression": CAPTCHA_CLASSIFIER_JS, "returnByValue": True},
-                session_id=session_id,
-            )
+            schedule_captcha_probe(ws, session_id, sessions[session_id].get("last_url", ""))
 
     elif method == "Network.requestWillBeSent" and session_id:
         request_id = params.get("requestId", "")
