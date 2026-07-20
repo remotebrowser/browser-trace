@@ -6,8 +6,6 @@ exposes a small read-only API over the same recordings dir so the videos can be
 listed and downloaded.
 
 Endpoints:
-    GET /                          HTML index listing every recording (with
-                                   inline <video> players) — handy for eyeballing.
     GET /health                    Liveness probe → {"status": "ok"}.
     GET /recordings                JSON array of recording metadata.
     GET /recordings/{id}           JSON metadata for one recording.
@@ -19,7 +17,6 @@ request rather than captured at startup, so it tracks config hot-reloads.
 """
 
 import json
-import html
 from pathlib import Path
 
 from aiohttp import web
@@ -123,54 +120,10 @@ async def handle_video(request: web.Request) -> web.StreamResponse:
     )
 
 
-async def handle_index(request: web.Request) -> web.Response:
-    recordings = _list_recordings()
-    rows = []
-    for r in recordings:
-        rid = html.escape(str(r.get("recording_id", "")))
-        url = html.escape(str(r.get("url", "")))
-        started = html.escape(str(r.get("started_at", "")))
-        dur = r.get("duration_seconds")
-        dur_str = f"{dur}s" if dur is not None else "—"
-        size = r.get("size_bytes")
-        size_str = f"{size / 1024:.0f} KB" if size else "—"
-        video_url = html.escape(str(r.get("video_url", "")))
-        rows.append(
-            f"""
-            <div class="rec">
-              <h2>{rid}</h2>
-              <div class="meta">started {started} · {dur_str} · {size_str}
-                · <a href="{video_url}">download</a>
-                · <a href="/recordings/{rid}">metadata</a></div>
-              <div class="src">{url}</div>
-              <video controls preload="metadata" src="{video_url}"></video>
-            </div>"""
-        )
-    body = "\n".join(rows) if rows else "<p>No recordings yet.</p>"
-    page = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>browser-trace recordings</title>
-<style>
-  body {{ font-family: system-ui, sans-serif; margin: 2rem; background:#111; color:#eee; }}
-  h1 {{ font-size: 1.4rem; }}
-  .rec {{ border:1px solid #333; border-radius:8px; padding:1rem; margin:1rem 0; }}
-  .rec h2 {{ font-size: 1rem; margin:0 0 .3rem; font-family:monospace; }}
-  .meta {{ font-size:.85rem; color:#aaa; }}
-  .src {{ font-size:.75rem; color:#777; word-break:break-all; margin:.3rem 0; }}
-  a {{ color:#6cf; }}
-  video {{ max-width:100%; margin-top:.5rem; background:#000; border-radius:4px; }}
-</style></head>
-<body>
-  <h1>browser-trace recordings ({len(recordings)})</h1>
-  {body}
-</body></html>"""
-    return web.Response(text=page, content_type="text/html")
-
-
 def build_app() -> web.Application:
     app = web.Application()
     app.add_routes(
         [
-            web.get("/", handle_index),
             web.get("/health", handle_health),
             web.get("/recordings", handle_list),
             web.get("/recordings/{recording_id}", handle_meta),
