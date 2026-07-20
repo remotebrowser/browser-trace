@@ -8,7 +8,6 @@ listed and downloaded.
 Endpoints:
     GET /health                    Liveness probe → {"status": "ok"}.
     GET /recordings                JSON array of recording metadata.
-    GET /recordings/{id}           JSON metadata for one recording.
     GET /recordings/{id}/video     The MP4 (streamed, supports Range requests so
                                    browsers can seek).
 
@@ -82,31 +81,6 @@ async def handle_list(request: web.Request) -> web.Response:
     return web.json_response({"recordings": _list_recordings()})
 
 
-async def handle_meta(request: web.Request) -> web.Response:
-    recording_id = request.match_info["recording_id"]
-    meta_path = _safe_recording_path(recording_id, ".json")
-    if meta_path is None:
-        # A finalized recording always has a sidecar; fall back to synthesizing
-        # one from the mp4 so a video with no json is still describable.
-        video_path = _safe_recording_path(recording_id, ".mp4")
-        if video_path is None:
-            raise web.HTTPNotFound(text=f"no recording {recording_id!r}")
-        return web.json_response(
-            {
-                "recording_id": recording_id,
-                "storage_key": video_path.name,
-                "size_bytes": video_path.stat().st_size,
-                "video_url": f"/recordings/{recording_id}/video",
-            }
-        )
-    try:
-        meta = json.loads(meta_path.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        raise web.HTTPInternalServerError(text=f"bad metadata: {e}")
-    meta["video_url"] = f"/recordings/{recording_id}/video"
-    return web.json_response(meta)
-
-
 async def handle_video(request: web.Request) -> web.StreamResponse:
     recording_id = request.match_info["recording_id"]
     video_path = _safe_recording_path(recording_id, ".mp4")
@@ -126,7 +100,6 @@ def build_app() -> web.Application:
         [
             web.get("/health", handle_health),
             web.get("/recordings", handle_list),
-            web.get("/recordings/{recording_id}", handle_meta),
             web.get("/recordings/{recording_id}/video", handle_video),
         ]
     )
